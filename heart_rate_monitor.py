@@ -5,6 +5,16 @@
 import numpy as np
 from collections import deque
 import math
+import serial
+import os
+try:
+    from scipy.signal import butter, filtfilt, find_peaks
+    _has_scipy = True
+except Exception:
+    butter = None
+    filtfilt = None
+    find_peaks = None
+    _has_scipy = False
 from ifxradarsdk import get_version
 from ifxradarsdk.fmcw import DeviceFmcw
 from ifxradarsdk.fmcw.types import FmcwSimpleSequenceConfig, FmcwSequenceChirp
@@ -27,6 +37,17 @@ class RadarDataProcessor:
         self.respiratory_buffer = deque(maxlen=500)  # 存储500个呼吸率数据点
         self.raw_phase_buffer = deque(maxlen=1000)  # 原始相位数据缓冲
         self.raw_data_buffer = deque(maxlen=200)  # 原始雷达数据缓冲（用于显示）
+        self.latest_range_doppler = None  # 最新范围-多普勒图幅度
+        self.range_axis = []
+        self.doppler_axis = []
+        # BMD101/ECG 串口相关
+        self.ecg_buffer = deque(maxlen=2000)  # 存储解析后的 ECG 样本
+        self.ecg_time_buffer = deque(maxlen=2000)  # 对应时间戳
+        self.serial_port = "COM5"
+        self.serial_baud = 57600
+        self.serial_thread = None
+        self.serial_running = False
+        self.serial_lock = threading.Lock()
         self.current_heart_rate = 0  # 当前心率BPM
         self.current_respiratory_rate = 0  # 当前呼吸率BPM
         self.is_running = False
@@ -90,11 +111,118 @@ class RadarDataProcessor:
             print(f"提取相位错误: {e}")
             return 0.0, 0.0
     
+    def compute_range_doppler_cube(self, frame_data, chirp_rt, half_range=True):
+        """计算范围-多普勒立方体，返回 RX x Doppler x Range 幅度。"""
+        rx, num_chirps, num_samples = frame_data.shape
+        if num_chirps < 2 or num_samples < 2:
+            return np.zeros((rx, num_chirps, num_samples // 2), dtype=float)
+
+        window_range = np.hanning(num_samples)
+        window_doppler = np.hanning(num_chirps)
+
+        rng = np.fft.fft(frame_data * window_range[np.newaxis, np.newaxis, :], axis=2)
+        if half_range:
+            rng = rng[..., : num_samples // 2]
+
+        dop = np.fft.fftshift(
+            np.fft.fft(rng * window_doppler[np.newaxis, :, np.newaxis], axis=1),
+            axes=1,
+        )
+        return np.abs(dop)
+
+    def get_range_axis(self, num_samples):
+        """计算距离轴（米）。"""
+        start_f = self.config.chirp.start_frequency_Hz
+        end_f = self.config.chirp.end_frequency_Hz
+        bandwidth = max(end_f - start_f, 1.0)
+        num_range = num_samples // 2
+        range_resolution = 3e8 / (2.0 * bandwidth)
+        return list(np.arange(num_range) * range_resolution)
+
+    def get_doppler_axis(self, num_chirps):
+        """计算多普勒轴（Hz）。"""
+        return list(np.fft.fftshift(np.fft.fftfreq(num_chirps, d=self.config.chirp_repetition_time_s)))
+
     def unwrap_phase(self, phase_buffer):
         """相位解缠绕"""
         phases = np.array(phase_buffer)
         unwrapped = np.unwrap(phases)
         return unwrapped
+
+    def _serial_reader_loop(self):
+        """后台线程：读取串口并解析为 ECG 样本。"""
+        # 尝试打开串口，多次重试以应对临时权限或占用问题
+        max_open_attempts = 6
+        attempt = 0
+        ser = None
+        while attempt < max_open_attempts:
+            try:
+                ser = serial.Serial(self.serial_port, self.serial_baud, timeout=1)
+                break
+            except PermissionError as pe:
+                attempt += 1
+                print(f"尝试打开串口 {self.serial_port} 被拒绝 (PermissionError)，尝试 {attempt}/{max_open_attempts}: {pe}")
+                # 给用户提示：可能端口被其他程序占用或权限不足
+                if attempt == max_open_attempts:
+                    print("严重: 无法打开串口，建议：\n 1) 确认没有其他程序占用 COM 端口（例如串口终端、IDE 终端）。\n 2) 在命令行中运行与可用的简单脚本验证端口可用。\n 3) 以管理员身份运行此服务尝试。\n")
+                    return
+                time.sleep(0.7)
+                continue
+            except Exception as e:
+                attempt += 1
+                print(f"尝试打开串口 {self.serial_port} 失败，尝试 {attempt}/{max_open_attempts}: {e}")
+                if attempt == max_open_attempts:
+                    return
+                time.sleep(0.7)
+
+        if ser is None:
+            print(f"无法打开串口 {self.serial_port}，已放弃")
+            return
+
+        print(f"串口已打开: {self.serial_port} (PID={os.getpid()})")
+        self.serial_running = True
+        try:
+            while self.serial_running:
+                try:
+                    line = ser.readline()
+                    if not line:
+                        continue
+                    # 去除常见的帧填充/同步字节 0xAA 0xAA，再按小端 (lo,hi) 解析 16-bit 有符号样本
+                    b = line.replace(b'\xaa\xaa', b'')
+                    vals = []
+                    for i in range(0, len(b) - 1, 2):
+                        lo = b[i]
+                        hi = b[i + 1]
+                        v = lo | (hi << 8)
+                        if v >= 0x8000:
+                            v -= 0x10000
+                        vals.append(int(v))
+
+                    if vals:
+                        with self.serial_lock:
+                            for vv in vals:
+                                # 只加入非零或明显值，避免纯控制包造成大量零
+                                self.ecg_buffer.append(vv)
+                except Exception as inner:
+                    print(f"串口读取/解析错误: {inner}")
+                    time.sleep(0.01)
+        finally:
+            try:
+                ser.close()
+            except Exception:
+                pass
+            self.serial_running = False
+
+    def start_serial_reader(self):
+        if self.serial_thread and self.serial_thread.is_alive():
+            return
+        self.serial_thread = threading.Thread(target=self._serial_reader_loop, daemon=True)
+        self.serial_thread.start()
+
+    def stop_serial_reader(self):
+        self.serial_running = False
+        if self.serial_thread:
+            self.serial_thread.join(timeout=0.5)
     
     def butter_bandpass_coeffs(self, lowcut, highcut, fs, order=2):
         """计算巴特沃斯带通滤波器系数（简化版）"""
@@ -194,7 +322,23 @@ class RadarDataProcessor:
                         for frame in frame_contents:
                             # 提取相位信息和原始数据
                             phase, raw_value = self.extract_phase_from_frame(frame)
-                            
+
+                            # 同时计算实时范围-多普勒图
+                            try:
+                                rd_cube = self.compute_range_doppler_cube(
+                                    frame,
+                                    self.config.chirp_repetition_time_s,
+                                    half_range=True,
+                                )
+                                rd0 = rd_cube[0] if rd_cube.shape[0] > 0 else rd_cube
+                                rd_db = 20.0 * np.log10(rd0 + 1e-6)
+                                self.range_axis = self.get_range_axis(frame.shape[2])
+                                self.doppler_axis = self.get_doppler_axis(frame.shape[1])
+                                with self.lock:
+                                    self.latest_range_doppler = rd_db.tolist()
+                            except Exception as rd_error:
+                                print(f"Range-Doppler 计算错误: {rd_error}")
+
                             with self.lock:
                                 self.frame_count += 1
                                 self.last_frame_time = time.time()
@@ -266,10 +410,20 @@ class RadarDataProcessor:
         if not self.is_running:
             thread = threading.Thread(target=self.process_radar_data, daemon=True)
             thread.start()
+            # 启动串口读取线程
+            try:
+                self.start_serial_reader()
+            except Exception as e:
+                print(f"启动串口读取失败: {e}")
     
     def stop(self):
         """停止数据采集"""
         self.is_running = False
+        # 停止串口读取
+        try:
+            self.stop_serial_reader()
+        except Exception as e:
+            print(f"停止串口读取失败: {e}")
     
     def get_data(self):
         """获取当前数据用于API响应"""
@@ -278,11 +432,91 @@ class RadarDataProcessor:
             heart_waveform = [float(x) for x in list(self.heart_rate_buffer)[-100:]] if self.heart_rate_buffer else []
             resp_waveform = [float(x) for x in list(self.respiratory_buffer)[-100:]] if self.respiratory_buffer else []
             raw_waveform = [float(x) for x in list(self.raw_data_buffer)[-100:]] if self.raw_data_buffer else []
+            # 获取 ECG 数据的副本（使用单独锁以减少与雷达处理的竞争）
+            with self.serial_lock:
+                ecg_raw_list = list(self.ecg_buffer)[-2000:]
+                ecg_time_list = list(self.ecg_time_buffer)[-2000:]
+
+            # 为前端显示生成一个平滑/下采样版本（可选）
+            ecg_display = []
+            if len(ecg_raw_list) > 0:
+                # 简单去直流并做短滑动平均以减少噪点
+                arr = np.array(ecg_raw_list, dtype=float)
+                arr = arr - np.mean(arr)
+                window = 3
+                if arr.size >= window:
+                    cumsum = np.cumsum(np.insert(arr, 0, 0))
+                    smooth = (cumsum[window:] - cumsum[:-window]) / window
+                    # 取最新 500 点用于展示
+                    ecg_display = [float(x) for x in smooth[-500:]]
+                else:
+                    ecg_display = [float(x) for x in arr[-500:]]
+            # R 峰检测与心率估计
+            ecg_hr = 0.0
+            try:
+                if len(ecg_raw_list) >= 60 and len(ecg_time_list) >= len(ecg_raw_list):
+                    times = np.array(ecg_time_list[-len(ecg_raw_list):])
+                    dt = np.median(np.diff(times)) if len(times) > 1 else 0.004
+                    fs_est = 1.0 / dt if dt > 0 else 250.0
+
+                    data_arr = np.array(ecg_raw_list[-len(times):], dtype=float)
+                    data_arr = data_arr - np.mean(data_arr)
+
+                    # Butterworth 带通 0.5-40Hz
+                    lowcut = 0.5
+                    highcut = 40.0
+                    if _has_scipy and butter is not None and filtfilt is not None:
+                        b, a = butter(4, [lowcut / (0.5 * fs_est), highcut / (0.5 * fs_est)], btype='band')
+                        filtered = filtfilt(b, a, data_arr)
+                    else:
+                        freqs = np.fft.fftfreq(len(data_arr), d=1.0/fs_est)
+                        fft_data = np.fft.fft(data_arr)
+                        mask = (np.abs(freqs) >= lowcut) & (np.abs(freqs) <= highcut)
+                        fft_data[~mask] = 0
+                        filtered = np.fft.ifft(fft_data).real
+
+                    # 平滑显示
+                    window = max(3, int(fs_est * 0.005))
+                    if filtered.size >= window:
+                        cumsum = np.cumsum(np.insert(filtered, 0, 0))
+                        smoothf = (cumsum[window:] - cumsum[:-window]) / window
+                        ecg_display = [float(x) for x in smoothf[-500:]] if smoothf.size > 0 else ecg_display
+
+                    # 峰值检测
+                    peaks_idx = []
+                    if _has_scipy and find_peaks is not None:
+                        min_dist = int(0.3 * fs_est)
+                        height_thr = np.percentile(filtered, 75)
+                        peaks_idx, _ = find_peaks(filtered, distance=min_dist, height=height_thr)
+                    else:
+                        thresh = np.mean(filtered) + np.std(filtered) * 0.5
+                        last_idx = -9999
+                        min_dist = int(0.3 * fs_est)
+                        for i in range(1, len(filtered)-1):
+                            if filtered[i] > thresh and filtered[i] > filtered[i-1] and filtered[i] > filtered[i+1]:
+                                if i - last_idx > min_dist:
+                                    peaks_idx.append(i)
+                                    last_idx = i
+
+                    if len(peaks_idx) > 1:
+                        peak_times = times[peaks_idx]
+                        rr = np.diff(peak_times)
+                        if len(rr) > 0:
+                            rr_mean = np.mean(rr[-8:])
+                            if rr_mean > 0:
+                                ecg_hr = 60.0 / rr_mean
+            except Exception as e:
+                print(f"ECG 实时处理错误: {e}")
             
             return {
                 'heart_rate_waveform': heart_waveform,
                 'respiratory_waveform': resp_waveform,
                 'raw_data_waveform': raw_waveform,  # 新增：原始数据波形
+                'ecg_waveform': ecg_raw_list[-500:],
+                'ecg_display': ecg_display,
+                'range_doppler_map': self.latest_range_doppler if self.latest_range_doppler is not None else [],
+                'range_axis': self.range_axis,
+                'doppler_axis': self.doppler_axis,
                 'current_heart_rate': float(self.current_heart_rate),
                 'current_respiratory_rate': float(self.current_respiratory_rate),
                 'frame_count': int(self.frame_count),  # 新增：帧计数
@@ -292,8 +526,10 @@ class RadarDataProcessor:
                     'raw_phase': len(self.raw_phase_buffer),
                     'heart_rate': len(self.heart_rate_buffer),
                     'respiratory': len(self.respiratory_buffer),
-                    'raw_data': len(self.raw_data_buffer)
+                    'raw_data': len(self.raw_data_buffer),
+                    'ecg': len(self.ecg_buffer)
                 },
+                'ecg_hr': float(ecg_hr),
                 'timestamp': float(time.time())
             }
 
