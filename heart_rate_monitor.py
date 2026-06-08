@@ -8,13 +8,20 @@ import math
 import serial
 import os
 try:
-    from scipy.signal import butter, filtfilt, find_peaks
+    from scipy.signal import butter, filtfilt, find_peaks, medfilt
     _has_scipy = True
 except Exception:
     butter = None
     filtfilt = None
     find_peaks = None
+    medfilt = None
     _has_scipy = False
+try:
+    import onnxruntime as ort
+    _has_onnxruntime = True
+except Exception:
+    ort = None
+    _has_onnxruntime = False
 from ifxradarsdk import get_version
 from ifxradarsdk.fmcw import DeviceFmcw
 from ifxradarsdk.fmcw.types import FmcwSimpleSequenceConfig, FmcwSequenceChirp
@@ -23,6 +30,168 @@ from flask_cors import CORS
 import threading
 import time
 import traceback
+
+
+class DistilledHeartRateExtractor:
+    """跨模态蒸馏模型推理与滤波输出。"""
+    def __init__(self, fs, heart_band, window_len=128, hop_len=32, model_path=None):
+        self.fs = fs
+        self.heart_band = heart_band
+        self.window_len = window_len
+        self.hop_len = hop_len
+        self.model_path = model_path or 'heart_rate_student.onnx'
+        self.model_loaded = False
+        self.model_type = None
+        self.model = None
+        self.load_model()
+
+    def load_model(self):
+        if self.model_path and os.path.exists(self.model_path):
+            if self.model_path.endswith('.onnx') and _has_onnxruntime:
+                try:
+                    self.model = ort.InferenceSession(self.model_path)
+                    self.model_type = 'onnx'
+                    self.model_loaded = True
+                    print(f'Loaded KD student model from {self.model_path}')
+                except Exception as e:
+                    print(f'加载 KD ONNX 模型失败: {e}')
+                    self.model_loaded = False
+            elif self.model_path.endswith('.npz'):
+                try:
+                    self.model = np.load(self.model_path, allow_pickle=True)
+                    self.model_type = 'npz'
+                    self.model_loaded = True
+                    print(f'Loaded KD student weights from {self.model_path}')
+                except Exception as e:
+                    print(f'加载 KD 权重失败: {e}')
+                    self.model_loaded = False
+        else:
+            print(f'KD 模型文件未找到: {self.model_path}; 将使用后备滤波器。')
+            self.model_loaded = False
+
+    def make_windows(self, signal):
+        signal = np.asarray(signal, dtype=float)
+        if signal.ndim != 1:
+            signal = signal.flatten()
+        n = len(signal)
+        if n < self.window_len:
+            return np.array([signal])
+        step = self.hop_len
+        windows = []
+        for start in range(0, max(1, n - self.window_len + 1), step):
+            windows.append(signal[start:start + self.window_len])
+        if windows and len(windows[-1]) < self.window_len:
+            last = signal[-self.window_len:]
+            windows[-1] = last
+        return np.vstack(windows)
+
+    def overlap_add(self, windows, output_len):
+        if windows.size == 0:
+            return np.zeros(output_len, dtype=float)
+        if windows.ndim == 1:
+            return windows[:output_len]
+        n_windows, win_len = windows.shape
+        out = np.zeros(output_len, dtype=float)
+        weight = np.zeros(output_len, dtype=float)
+        for i in range(n_windows):
+            start = i * self.hop_len
+            end = start + win_len
+            if end > output_len:
+                end = output_len
+                segment = windows[i, :end - start]
+            else:
+                segment = windows[i]
+            out[start:end] += segment
+            weight[start:end] += 1.0
+        weight[weight == 0] = 1.0
+        return out / weight
+
+    def predict(self, signal):
+        signal = np.asarray(signal, dtype=float)
+        if signal.size == 0:
+            return np.array([], dtype=float)
+        windows = self.make_windows(signal)
+        if self.model_loaded and self.model_type == 'onnx':
+            preds = []
+            input_name = self.model.get_inputs()[0].name
+            for w in windows:
+                x = w.astype(np.float32).reshape(1, 1, -1)
+                try:
+                    result = self.model.run(None, {input_name: x})
+                    pred = np.squeeze(result[0])
+                except Exception as e:
+                    print(f'KD ONNX 推理失败: {e}')
+                    pred = w
+                preds.append(pred)
+            preds = np.vstack(preds)
+        elif self.model_loaded and self.model_type == 'npz':
+            preds = self.simple_npz_predict(windows)
+        else:
+            preds = self.simple_fallback(windows)
+
+        output = self.overlap_add(preds, signal.size)
+        return self.post_process(output)
+
+    def simple_npz_predict(self, windows):
+        if not hasattr(self.model, 'files') or 'W0' not in self.model:
+            return self.simple_fallback(windows)
+        output = []
+        for w in windows:
+            x = (w - np.mean(w)) / (np.std(w) + 1e-6)
+            for i in range(10):
+                key_w = f'W{i}'
+                key_b = f'b{i}'
+                if key_w in self.model and key_b in self.model:
+                    x = np.dot(x, self.model[key_w]) + self.model[key_b]
+                    x = np.tanh(x)
+                else:
+                    break
+            output.append(x)
+        return np.vstack(output)
+
+    def simple_fallback(self, windows):
+        preds = []
+        for w in windows:
+            w = w - np.mean(w)
+            freqs = np.fft.rfftfreq(w.size, d=1.0 / self.fs)
+            fft_w = np.fft.rfft(w)
+            mask = (freqs >= self.heart_band[0]) & (freqs <= self.heart_band[1])
+            fft_w[~mask] = 0
+            pred = np.fft.irfft(fft_w, n=w.size)
+            preds.append(pred)
+        return np.vstack(preds)
+
+    def post_process(self, waveform):
+        if waveform.size == 0:
+            return waveform
+        waveform = waveform - np.median(waveform)
+        waveform = np.clip(waveform, -3.0, 3.0)
+        if _has_scipy and butter is not None and filtfilt is not None:
+            b, a = butter(3, np.array(self.heart_band) / (0.5 * self.fs), btype='band')
+            waveform = filtfilt(b, a, waveform)
+        if _has_scipy and medfilt is not None:
+            try:
+                waveform = medfilt(waveform, kernel_size=7)
+            except Exception:
+                pass
+        return waveform
+
+    def estimate_hr(self, waveform):
+        if waveform.size < int(self.fs * 2):
+            return 0.0
+        waveform = waveform - np.mean(waveform)
+        freqs = np.fft.rfftfreq(waveform.size, d=1.0 / self.fs)
+        spectrum = np.abs(np.fft.rfft(waveform))
+        mask = (freqs >= self.heart_band[0]) & (freqs <= self.heart_band[1])
+        if not np.any(mask):
+            return 0.0
+        band_freqs = freqs[mask]
+        band_spec = spectrum[mask]
+        if band_spec.size == 0:
+            return 0.0
+        peak = band_freqs[np.argmax(band_spec)]
+        return float(peak * 60.0)
+
 
 app = Flask(__name__)
 CORS(app)
@@ -50,6 +219,10 @@ class RadarDataProcessor:
         self.serial_lock = threading.Lock()
         self.current_heart_rate = 0  # 当前心率BPM
         self.current_respiratory_rate = 0  # 当前呼吸率BPM
+        self.latest_kd_waveform = []
+        self.current_kd_hr = 0.0
+        self.kd_status = 'fallback'
+        self.kd_processor = DistilledHeartRateExtractor(fs=self.fs, heart_band=self.heart_rate_band)
         self.is_running = False
         self.lock = threading.Lock()
         self.frame_count = 0  # 帧计数器
@@ -194,15 +367,18 @@ class RadarDataProcessor:
                         lo = b[i]
                         hi = b[i + 1]
                         v = lo | (hi << 8)
+                        
                         if v >= 0x8000:
                             v -= 0x10000
                         vals.append(int(v))
 
                     if vals:
+                        now = time.time()
                         with self.serial_lock:
                             for vv in vals:
                                 # 只加入非零或明显值，避免纯控制包造成大量零
                                 self.ecg_buffer.append(vv)
+                                self.ecg_time_buffer.append(now)
                 except Exception as inner:
                     print(f"串口读取/解析错误: {inner}")
                     time.sleep(0.01)
@@ -373,6 +549,16 @@ class RadarDataProcessor:
                                         )
                                         if len(respiratory_signal) > 0:
                                             self.respiratory_buffer.append(respiratory_signal[-1])
+
+                                        # Cross-modal KD 模型输出
+                                        try:
+                                            kd_wave = self.kd_processor.predict(unwrapped_phase)
+                                            self.latest_kd_waveform = [float(x) for x in kd_wave[-500:]]
+                                            self.current_kd_hr = self.kd_processor.estimate_hr(kd_wave)
+                                            self.kd_status = 'model' if self.kd_processor.model_loaded else 'fallback'
+                                        except Exception as kd_error:
+                                            print(f"KD 模型实时处理错误: {kd_error}")
+                                            self.kd_status = 'error'
                                         
                                         # 估计当前心率和呼吸率
                                         if len(self.heart_rate_buffer) >= 100:
@@ -514,6 +700,9 @@ class RadarDataProcessor:
                 'raw_data_waveform': raw_waveform,  # 新增：原始数据波形
                 'ecg_waveform': ecg_raw_list[-500:],
                 'ecg_display': ecg_display,
+                'kd_waveform': self.latest_kd_waveform,
+                'kd_hr': float(self.current_kd_hr),
+                'kd_status': self.kd_status,
                 'range_doppler_map': self.latest_range_doppler if self.latest_range_doppler is not None else [],
                 'range_axis': self.range_axis,
                 'doppler_axis': self.doppler_axis,

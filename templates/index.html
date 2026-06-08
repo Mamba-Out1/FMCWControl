@@ -257,6 +257,19 @@
                 </div>
             </div>
 
+            <!-- KD 实时心率卡片 -->
+            <div class="card metric-card">
+                <div class="icon">🧠</div>
+                <div class="metric-label">
+                    <span class="status-indicator" id="kdStatus"></span>
+                    KD 心率
+                </div>
+                <div class="metric-value" style="color: #9b59b6;">
+                    <span id="kdHR">--</span>
+                    <span class="metric-unit">BPM</span>
+                </div>
+            </div>
+
             <!-- 雷达状态卡片 -->
             <div class="card metric-card">
                 <div class="icon">📡</div>
@@ -309,6 +322,17 @@
                 </div>
                 <div class="chart-container">
                     <canvas id="ecgChart"></canvas>
+                </div>
+            </div>
+
+            <!-- KD 模型拟合心率波形 -->
+            <div class="card chart-card">
+                <div class="chart-header">
+                    <div class="chart-title">🤖 KD 模型滤波波形</div>
+                    <div style="font-size: 0.9em; color: #666;">跨模态蒸馏后处理结果</div>
+                </div>
+                <div class="chart-container">
+                    <canvas id="kdChart"></canvas>
                 </div>
             </div>
 
@@ -457,6 +481,26 @@
             options: commonOptions
         });
 
+        // KD 模型滤波波形图
+        const kdCtx = document.getElementById('kdChart').getContext('2d');
+        const kdChart = new Chart(kdCtx, {
+            type: 'line',
+            data: {
+                labels: [],
+                datasets: [{
+                    label: 'KD Filtered Signal',
+                    data: [],
+                    borderColor: '#8e44ad',
+                    backgroundColor: 'rgba(142, 68, 173, 0.08)',
+                    borderWidth: 1.5,
+                    tension: 0.15,
+                    fill: true,
+                    pointRadius: 0
+                }]
+            },
+            options: Object.assign({}, commonOptions, {scales: {x: {display: false}, y: {display: true}}})
+        });
+
         const rdCanvas = document.getElementById('rangeDopplerCanvas');
         const rdCtx = rdCanvas.getContext('2d');
 
@@ -578,6 +622,18 @@
                     ecgHRElem.textContent = '--';
                 }
 
+                const kdStatus = document.getElementById('kdStatus');
+                const kdHRElem = document.getElementById('kdHR');
+                if (data.kd_hr && data.kd_hr > 0) {
+                    kdStatus.classList.add('active');
+                    kdStatus.classList.remove('inactive');
+                    kdHRElem.textContent = data.kd_hr.toFixed(1);
+                } else {
+                    kdStatus.classList.remove('active');
+                    kdStatus.classList.add('inactive');
+                    kdHRElem.textContent = '--';
+                }
+
                 if (data.is_running) {
                     radarStatus.classList.add('active');
                     radarStatus.classList.remove('inactive');
@@ -608,6 +664,14 @@
                     ecgChart.update('none');
                 }
 
+                // 更新 KD 模型波形
+                const kdToShow = data.kd_waveform || [];
+                if (kdToShow.length > 0) {
+                    kdChart.data.labels = Array(kdToShow.length).fill('');
+                    kdChart.data.datasets[0].data = kdToShow;
+                    kdChart.update('none');
+                }
+
                 // 更新呼吸波形
                 if (data.respiratory_waveform && data.respiratory_waveform.length > 0) {
                     respiratoryChart.data.labels = Array(data.respiratory_waveform.length).fill('');
@@ -626,6 +690,8 @@
 运行状态: ${data.is_running ? '✅ 运行中' : '❌ 已停止'}
 帧计数: ${data.frame_count || 0}
 心率: ${data.current_heart_rate.toFixed(2)} BPM
+KD 心率: ${data.kd_hr > 0 ? data.kd_hr.toFixed(2) + ' BPM' : '--'}
+KD 状态: ${data.kd_status || 'unknown'}
 呼吸率: ${data.current_respiratory_rate.toFixed(2)} BPM
 原始数据点: ${data.raw_data_waveform ? data.raw_data_waveform.length : 0}
 心率数据点: ${data.heart_rate_waveform ? data.heart_rate_waveform.length : 0}
