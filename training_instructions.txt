@@ -1,0 +1,34 @@
+跨模态蒸馏训练程序 - 安装和使用说明
+
+1. 安装依赖:
+pip install torch torchvision numpy
+
+2. 运行训练:
+python kd_train.py
+
+3. 将生成以下模型文件:
+   - heart_rate_student.onnx
+   - heart_rate_student.pt
+   - heart_rate_student.npz
+
+4. 在heart_rate_monitor.py中使用:
+   import onnxruntime
+   import numpy as np
+   
+   # 加载ONNX模型
+   session = onnxruntime.InferenceSession('heart_rate_student.onnx')
+   
+   # 准备输入数据 (批大小, 序列长度, 特征维度)
+   radar_input = np.random.randn(1, 100, 64).astype(np.float32)
+   
+   # 推理
+   input_name = session.get_inputs()[0].name
+   output_name = session.get_outputs()[0].name
+   heart_rate = session.run([output_name], {input_name: radar_input})[0]
+   
+   print(f"预测心率: {heart_rate[0,0]:.1f} BPM")
+
+5. 论文方法概述:
+   ECG Transformer → Feature KD → Radar Transformer → Heart Rate
+   总损失: L = L_HR + 0.5*L_feature + 0.2*L_attention
+            
