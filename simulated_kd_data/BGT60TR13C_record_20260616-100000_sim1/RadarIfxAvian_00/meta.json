@@ -1,0 +1,6 @@
+{
+    "adc_resolution": 12,
+    "description": "Simulated BGT60TR13C FMCW Radar Sensor",
+    "sdk_version": "simulated",
+    "uuid": "sim-1"
+}

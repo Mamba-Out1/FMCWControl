@@ -1,5 +1,5 @@
-# ===========================================================================
-# 实时心率监测系统 - 后端服务
+﻿# ===========================================================================
+# 瀹炴椂蹇冪巼鐩戞祴绯荤粺 - 鍚庣鏈嶅姟
 # ===========================================================================
 
 import numpy as np
@@ -22,6 +22,14 @@ try:
 except Exception:
     ort = None
     _has_onnxruntime = False
+try:
+    import torch
+    import torch.nn as nn
+    _has_torch = True
+except Exception:
+    torch = None
+    nn = None
+    _has_torch = False
 from ifxradarsdk import get_version
 from ifxradarsdk.fmcw import DeviceFmcw
 from ifxradarsdk.fmcw.types import FmcwSimpleSequenceConfig, FmcwSequenceChirp
@@ -32,42 +40,105 @@ import time
 import traceback
 
 
+if _has_torch:
+    class TorchRadarTransformer(nn.Module):
+        def __init__(self, input_dim=64, hidden_dim=128, nhead=4, num_layers=2):
+            super().__init__()
+            self.input_proj = nn.Linear(input_dim, hidden_dim)
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=hidden_dim,
+                nhead=nhead,
+                dim_feedforward=256,
+                dropout=0.1,
+                batch_first=True,
+            )
+            self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+            self.reg_head = nn.Sequential(
+                nn.Linear(hidden_dim, 64),
+                nn.ReLU(),
+                nn.Linear(64, 32),
+                nn.ReLU(),
+                nn.Linear(32, 1),
+            )
+            self.feature_proj = nn.Linear(hidden_dim, 256)
+
+        def forward(self, x):
+            x_proj = self.input_proj(x)
+            seq_len = x_proj.size(1)
+            position = torch.arange(seq_len, device=x.device).unsqueeze(0).unsqueeze(-1)
+            x_proj = x_proj + (position / max(seq_len, 1))
+            encoded = self.transformer(x_proj)
+            features = encoded.mean(dim=1)
+            return self.reg_head(features)
+else:
+    TorchRadarTransformer = None
+
+
 class DistilledHeartRateExtractor:
-    """跨模态蒸馏模型推理与滤波输出。"""
+    """Documentation."""
     def __init__(self, fs, heart_band, window_len=128, hop_len=32, model_path=None):
         self.fs = fs
         self.heart_band = heart_band
         self.window_len = window_len
         self.hop_len = hop_len
-        self.model_path = model_path or 'heart_rate_student.onnx'
+        self.model_path = model_path
         self.model_loaded = False
         self.model_type = None
         self.model = None
+        self.last_model_hr = 0.0
         self.load_model()
 
     def load_model(self):
-        if self.model_path and os.path.exists(self.model_path):
-            if self.model_path.endswith('.onnx') and _has_onnxruntime:
+        candidates = []
+        if self.model_path:
+            candidates.append(self.model_path)
+        candidates.extend(['heart_rate_student.onnx', 'heart_rate_student.pt', 'heart_rate_student.npz'])
+
+        seen = set()
+        for path in candidates:
+            if not path or path in seen or not os.path.exists(path):
+                continue
+            seen.add(path)
+
+            if path.endswith('.onnx') and _has_onnxruntime:
                 try:
-                    self.model = ort.InferenceSession(self.model_path)
+                    self.model = ort.InferenceSession(path)
                     self.model_type = 'onnx'
                     self.model_loaded = True
-                    print(f'Loaded KD student model from {self.model_path}')
+                    self.model_path = path
+                    print(f"Loaded KD ONNX model: {path}")
+                    return
                 except Exception as e:
-                    print(f'加载 KD ONNX 模型失败: {e}')
-                    self.model_loaded = False
-            elif self.model_path.endswith('.npz'):
+                    print(f"Failed to load KD ONNX model {path}: {e}")
+
+            if path.endswith('.pt') and _has_torch and TorchRadarTransformer is not None:
                 try:
-                    self.model = np.load(self.model_path, allow_pickle=True)
+                    model = TorchRadarTransformer()
+                    state_dict = torch.load(path, map_location='cpu')
+                    model.load_state_dict(state_dict, strict=False)
+                    model.eval()
+                    self.model = model
+                    self.model_type = 'torch'
+                    self.model_loaded = True
+                    self.model_path = path
+                    print(f"Loaded KD PyTorch model: {path}")
+                    return
+                except Exception as e:
+                    print(f"Failed to load KD PyTorch model {path}: {e}")
+
+            if path.endswith('.npz'):
+                try:
+                    self.model = np.load(path, allow_pickle=True)
                     self.model_type = 'npz'
                     self.model_loaded = True
-                    print(f'Loaded KD student weights from {self.model_path}')
+                    self.model_path = path
+                    print(f"Loaded KD NumPy weights: {path}")
+                    return
                 except Exception as e:
-                    print(f'加载 KD 权重失败: {e}')
-                    self.model_loaded = False
-        else:
-            print(f'KD 模型文件未找到: {self.model_path}; 将使用后备滤波器。')
-            self.model_loaded = False
+                    print(f"Failed to load KD NumPy weights {path}: {e}")
+
+        print("KD model not loaded; using adaptive fallback filter.")
+        self.model_loaded = False
 
     def make_windows(self, signal):
         signal = np.asarray(signal, dtype=float)
@@ -106,10 +177,79 @@ class DistilledHeartRateExtractor:
         weight[weight == 0] = 1.0
         return out / weight
 
-    def predict(self, signal):
+    def predict_hr_from_features(self, radar_features):
+        features = np.asarray(radar_features, dtype=np.float32)
+        if features.ndim != 2 or features.shape[1] != 64 or features.shape[0] < 2:
+            return 0.0
+
+        if self.model_loaded and self.model_type == 'onnx':
+            try:
+                input_name = self.model.get_inputs()[0].name
+                result = self.model.run(None, {input_name: features[np.newaxis, :, :]})
+                hr = float(np.asarray(result[0]).reshape(-1)[0])
+                if 40.0 <= hr <= 180.0:
+                    self.last_model_hr = hr
+                    return hr
+            except Exception as e:
+                print(f'KD ONNX HR inference failed: {e}')
+
+        if self.model_loaded and self.model_type == 'torch' and _has_torch:
+            try:
+                with torch.no_grad():
+                    x = torch.from_numpy(features[np.newaxis, :, :]).float()
+                    result = self.model(x)
+                hr = float(result.detach().cpu().numpy().reshape(-1)[0])
+                if 40.0 <= hr <= 180.0:
+                    self.last_model_hr = hr
+                    return hr
+            except Exception as e:
+                print(f'KD PyTorch HR inference failed: {e}')
+
+        return 0.0
+
+    def simple_bandpass_1d(self, signal, lowcut, highcut):
+        signal = np.asarray(signal, dtype=float)
+        if signal.size < 4:
+            return signal
+        fft_data = np.fft.rfft(signal)
+        freqs = np.fft.rfftfreq(signal.size, d=1.0 / self.fs)
+        mask = (freqs >= lowcut) & (freqs <= highcut)
+        fft_data[~mask] = 0
+        return np.fft.irfft(fft_data, n=signal.size)
+
+    def adaptive_filter(self, signal, model_hr=0.0):
+        signal = np.asarray(signal, dtype=float)
+        if signal.size == 0:
+            return signal
+
+        signal = signal - np.median(signal)
+        if model_hr and 40.0 <= model_hr <= 180.0:
+            center = model_hr / 60.0
+            low = max(self.heart_band[0], center - 0.28)
+            high = min(self.heart_band[1], center + 0.28)
+            if high <= low + 0.05:
+                low, high = self.heart_band
+        else:
+            low, high = self.heart_band
+
+        if _has_scipy and butter is not None and filtfilt is not None and signal.size > int(self.fs * 3):
+            try:
+                b, a = butter(3, [low / (0.5 * self.fs), high / (0.5 * self.fs)], btype='band')
+                filtered = filtfilt(b, a, signal)
+            except Exception:
+                filtered = self.simple_bandpass_1d(signal, low, high)
+        else:
+            filtered = self.simple_bandpass_1d(signal, low, high)
+
+        return self.post_process(filtered)
+
+    def predict(self, signal, radar_features=None):
         signal = np.asarray(signal, dtype=float)
         if signal.size == 0:
             return np.array([], dtype=float)
+        model_hr = self.predict_hr_from_features(radar_features) if radar_features is not None else 0.0
+        if model_hr > 0:
+            return self.adaptive_filter(signal, model_hr)
         windows = self.make_windows(signal)
         if self.model_loaded and self.model_type == 'onnx':
             preds = []
@@ -120,7 +260,7 @@ class DistilledHeartRateExtractor:
                     result = self.model.run(None, {input_name: x})
                     pred = np.squeeze(result[0])
                 except Exception as e:
-                    print(f'KD ONNX 推理失败: {e}')
+                    print(f'KD ONNX 鎺ㄧ悊澶辫触: {e}')
                     pred = w
                 preds.append(pred)
             preds = np.vstack(preds)
@@ -196,42 +336,48 @@ class DistilledHeartRateExtractor:
 app = Flask(__name__)
 CORS(app)
 
-# 启用Flask调试模式的详细错误
+# 鍚敤Flask璋冭瘯妯″紡鐨勮缁嗛敊璇?
 app.config['PROPAGATE_EXCEPTIONS'] = True
 
-# 全局数据存储
+# 鍏ㄥ眬鏁版嵁瀛樺偍
 class RadarDataProcessor:
     def __init__(self):
-        self.heart_rate_buffer = deque(maxlen=500)  # 存储500个心率数据点
-        self.respiratory_buffer = deque(maxlen=500)  # 存储500个呼吸率数据点
-        self.raw_phase_buffer = deque(maxlen=1000)  # 原始相位数据缓冲
-        self.raw_data_buffer = deque(maxlen=200)  # 原始雷达数据缓冲（用于显示）
-        self.latest_range_doppler = None  # 最新范围-多普勒图幅度
+        # 淇″彿澶勭悊鍙傛暟
+        self.fs = 20  # 閲囨牱鐜?(Hz) - 涓巉rame_repetition_time瀵瑰簲
+        self.heart_rate_band = [0.8, 2.5]  # 蹇冪巼棰戝甫 (48-150 BPM)
+        self.respiratory_band = [0.15, 0.5]  # 鍛煎惛鐜囬甯?(9-30 BPM)
+        
+        self.heart_rate_buffer = deque(maxlen=500)  # 瀛樺偍500涓績鐜囨暟鎹偣
+        self.respiratory_buffer = deque(maxlen=500)  # 瀛樺偍500涓懠鍚哥巼鏁版嵁鐐?
+        self.raw_phase_buffer = deque(maxlen=1000)  # 鍘熷鐩镐綅鏁版嵁缂撳啿
+        self.radar_feature_buffer = deque(maxlen=160)
+        self.raw_data_buffer = deque(maxlen=200)  # 鍘熷闆疯揪鏁版嵁缂撳啿锛堢敤浜庢樉绀猴級
+        self.latest_range_doppler = None  # 鏈€鏂拌寖鍥?澶氭櫘鍕掑浘骞呭害
         self.range_axis = []
         self.doppler_axis = []
-        # BMD101/ECG 串口相关
-        self.ecg_buffer = deque(maxlen=2000)  # 存储解析后的 ECG 样本
-        self.ecg_time_buffer = deque(maxlen=2000)  # 对应时间戳
+        # BMD101/ECG 涓插彛鐩稿叧
+        self.ecg_buffer = deque(maxlen=2000)  # 瀛樺偍瑙ｆ瀽鍚庣殑 ECG 鏍锋湰
+        self.ecg_time_buffer = deque(maxlen=2000)  # 瀵瑰簲鏃堕棿鎴?
         self.serial_port = "COM5"
         self.serial_baud = 57600
         self.serial_thread = None
         self.serial_running = False
         self.serial_lock = threading.Lock()
-        self.current_heart_rate = 0  # 当前心率BPM
-        self.current_respiratory_rate = 0  # 当前呼吸率BPM
+        self.current_heart_rate = 0  # 褰撳墠蹇冪巼BPM
+        self.current_respiratory_rate = 0  # 褰撳墠鍛煎惛鐜嘊PM
         self.latest_kd_waveform = []
         self.current_kd_hr = 0.0
         self.kd_status = 'fallback'
         self.kd_processor = DistilledHeartRateExtractor(fs=self.fs, heart_band=self.heart_rate_band)
         self.is_running = False
         self.lock = threading.Lock()
-        self.frame_count = 0  # 帧计数器
-        self.error_message = ""  # 错误信息
-        self.last_frame_time = 0  # 上一帧时间
+        self.frame_count = 0  # 甯ц鏁板櫒
+        self.error_message = ""  # 閿欒淇℃伅
+        self.last_frame_time = 0  # 涓婁竴甯ф椂闂?
         
-        # 雷达配置
+        # 闆疯揪閰嶇疆
         self.config = FmcwSimpleSequenceConfig(
-            frame_repetition_time_s=0.05,  # 20Hz帧率
+            frame_repetition_time_s=0.05,  # 20Hz甯х巼
             chirp_repetition_time_s=500e-6,
             num_chirps=16,
             tdm_mimo=False,
@@ -249,43 +395,56 @@ class RadarDataProcessor:
             ),
         )
         
-        # 信号处理参数
-        self.fs = 20  # 采样率 (Hz) - 与frame_repetition_time对应
-        self.heart_rate_band = [0.8, 2.5]  # 心率频带 (48-150 BPM)
-        self.respiratory_band = [0.15, 0.5]  # 呼吸率频带 (9-30 BPM)
-        
     def extract_phase_from_frame(self, frame_data):
-        """从雷达帧数据中提取相位信息"""
+        """Extract phase and display value from one radar frame."""
         try:
-            # frame_data 形状: (1, 16, 128) - (天线, 扫频, 采样点)
-            # 选择特定距离区间的数据 (假设目标在中间距离)
-            range_bin_start = 50  # 距离单元起始
-            range_bin_end = 80    # 距离单元结束
+            # frame_data 褰㈢姸: (1, 16, 128) - (澶╃嚎, 鎵, 閲囨牱鐐?
+            # 閫夋嫨鐗瑰畾璺濈鍖洪棿鐨勬暟鎹?(鍋囪鐩爣鍦ㄤ腑闂磋窛绂?
+            range_bin_start = 50  # 璺濈鍗曞厓璧峰
+            range_bin_end = 80    # 璺濈鍗曞厓缁撴潫
             
-            # 提取感兴趣区域的数据
+            # 鎻愬彇鎰熷叴瓒ｅ尯鍩熺殑鏁版嵁
             roi_data = frame_data[0, :, range_bin_start:range_bin_end]
             
-            # 计算平均幅度最大的距离单元
+            # 璁＄畻骞冲潎骞呭害鏈€澶х殑璺濈鍗曞厓
             amplitudes = np.abs(roi_data)
             mean_amplitudes = np.mean(amplitudes, axis=0)
             best_range_bin = np.argmax(mean_amplitudes)
             
-            # 提取该距离单元的数据
+            # 鎻愬彇璇ヨ窛绂诲崟鍏冪殑鏁版嵁
             target_data = roi_data[:, best_range_bin]
             
-            # 计算相位
+            # 璁＄畻鐩镐綅
             phase = np.angle(target_data.mean())
             
-            # 同时保存原始数据的平均值用于显示
+            # 鍚屾椂淇濆瓨鍘熷鏁版嵁鐨勫钩鍧囧€肩敤浜庢樉绀?
             raw_value = float(np.mean(target_data.real))
             
             return phase, raw_value
         except Exception as e:
-            print(f"提取相位错误: {e}")
+            print(f"鎻愬彇鐩镐綅閿欒: {e}")
             return 0.0, 0.0
     
+    def extract_kd_radar_feature(self, frame_data):
+        try:
+            frame_fft = np.abs(np.fft.fft(frame_data, axis=-1))
+            n_freqs = min(64, frame_fft.shape[-1] // 2)
+            energy = np.mean(frame_fft[:, :, :n_freqs], axis=(0, 1))
+            if len(energy) < 64:
+                energy = np.interp(np.linspace(0, len(energy) - 1, 64), np.arange(len(energy)), energy)
+            else:
+                energy = energy[:64]
+            energy = np.log1p(energy.astype(np.float32))
+            std = np.std(energy)
+            if std > 1e-6:
+                energy = (energy - np.mean(energy)) / std
+            return energy.astype(np.float32)
+        except Exception as e:
+            print(f"KD radar feature extraction error: {e}")
+            return np.zeros(64, dtype=np.float32)
+
     def compute_range_doppler_cube(self, frame_data, chirp_rt, half_range=True):
-        """计算范围-多普勒立方体，返回 RX x Doppler x Range 幅度。"""
+        """Documentation."""
         rx, num_chirps, num_samples = frame_data.shape
         if num_chirps < 2 or num_samples < 2:
             return np.zeros((rx, num_chirps, num_samples // 2), dtype=float)
@@ -304,7 +463,7 @@ class RadarDataProcessor:
         return np.abs(dop)
 
     def get_range_axis(self, num_samples):
-        """计算距离轴（米）。"""
+        """Documentation."""
         start_f = self.config.chirp.start_frequency_Hz
         end_f = self.config.chirp.end_frequency_Hz
         bandwidth = max(end_f - start_f, 1.0)
@@ -313,18 +472,18 @@ class RadarDataProcessor:
         return list(np.arange(num_range) * range_resolution)
 
     def get_doppler_axis(self, num_chirps):
-        """计算多普勒轴（Hz）。"""
+        """Documentation."""
         return list(np.fft.fftshift(np.fft.fftfreq(num_chirps, d=self.config.chirp_repetition_time_s)))
 
     def unwrap_phase(self, phase_buffer):
-        """相位解缠绕"""
+        """Documentation."""
         phases = np.array(phase_buffer)
         unwrapped = np.unwrap(phases)
         return unwrapped
 
     def _serial_reader_loop(self):
-        """后台线程：读取串口并解析为 ECG 样本。"""
-        # 尝试打开串口，多次重试以应对临时权限或占用问题
+        """Documentation."""
+        # 灏濊瘯鎵撳紑涓插彛锛屽娆￠噸璇曚互搴斿涓存椂鏉冮檺鎴栧崰鐢ㄩ棶棰?
         max_open_attempts = 6
         attempt = 0
         ser = None
@@ -334,25 +493,25 @@ class RadarDataProcessor:
                 break
             except PermissionError as pe:
                 attempt += 1
-                print(f"尝试打开串口 {self.serial_port} 被拒绝 (PermissionError)，尝试 {attempt}/{max_open_attempts}: {pe}")
-                # 给用户提示：可能端口被其他程序占用或权限不足
+                print(f"灏濊瘯鎵撳紑涓插彛 {self.serial_port} 琚嫆缁?(PermissionError)锛屽皾璇?{attempt}/{max_open_attempts}: {pe}")
+                # 缁欑敤鎴锋彁绀猴細鍙兘绔彛琚叾浠栫▼搴忓崰鐢ㄦ垨鏉冮檺涓嶈冻
                 if attempt == max_open_attempts:
-                    print("严重: 无法打开串口，建议：\n 1) 确认没有其他程序占用 COM 端口（例如串口终端、IDE 终端）。\n 2) 在命令行中运行与可用的简单脚本验证端口可用。\n 3) 以管理员身份运行此服务尝试。\n")
+                    print("涓ラ噸: 鏃犳硶鎵撳紑涓插彛锛屽缓璁細\n 1) 纭娌℃湁鍏朵粬绋嬪簭鍗犵敤 COM 绔彛锛堜緥濡備覆鍙ｇ粓绔€両DE 缁堢锛夈€俓n 2) 鍦ㄥ懡浠よ涓繍琛屼笌鍙敤鐨勭畝鍗曡剼鏈獙璇佺鍙ｅ彲鐢ㄣ€俓n 3) 浠ョ鐞嗗憳韬唤杩愯姝ゆ湇鍔″皾璇曘€俓n")
                     return
                 time.sleep(0.7)
                 continue
             except Exception as e:
                 attempt += 1
-                print(f"尝试打开串口 {self.serial_port} 失败，尝试 {attempt}/{max_open_attempts}: {e}")
+                print(f"灏濊瘯鎵撳紑涓插彛 {self.serial_port} 澶辫触锛屽皾璇?{attempt}/{max_open_attempts}: {e}")
                 if attempt == max_open_attempts:
                     return
                 time.sleep(0.7)
 
         if ser is None:
-            print(f"无法打开串口 {self.serial_port}，已放弃")
+            print(f"鏃犳硶鎵撳紑涓插彛 {self.serial_port}锛屽凡鏀惧純")
             return
 
-        print(f"串口已打开: {self.serial_port} (PID={os.getpid()})")
+        print(f"涓插彛宸叉墦寮€: {self.serial_port} (PID={os.getpid()})")
         self.serial_running = True
         try:
             while self.serial_running:
@@ -360,7 +519,7 @@ class RadarDataProcessor:
                     line = ser.readline()
                     if not line:
                         continue
-                    # 去除常见的帧填充/同步字节 0xAA 0xAA，再按小端 (lo,hi) 解析 16-bit 有符号样本
+                    # 鍘婚櫎甯歌鐨勫抚濉厖/鍚屾瀛楄妭 0xAA 0xAA锛屽啀鎸夊皬绔?(lo,hi) 瑙ｆ瀽 16-bit 鏈夌鍙锋牱鏈?
                     b = line.replace(b'\xaa\xaa', b'')
                     vals = []
                     for i in range(0, len(b) - 1, 2):
@@ -376,11 +535,11 @@ class RadarDataProcessor:
                         now = time.time()
                         with self.serial_lock:
                             for vv in vals:
-                                # 只加入非零或明显值，避免纯控制包造成大量零
+                                # 鍙姞鍏ラ潪闆舵垨鏄庢樉鍊硷紝閬垮厤绾帶鍒跺寘閫犳垚澶ч噺闆?
                                 self.ecg_buffer.append(vv)
                                 self.ecg_time_buffer.append(now)
                 except Exception as inner:
-                    print(f"串口读取/解析错误: {inner}")
+                    print(f"涓插彛璇诲彇/瑙ｆ瀽閿欒: {inner}")
                     time.sleep(0.01)
         finally:
             try:
@@ -401,20 +560,20 @@ class RadarDataProcessor:
             self.serial_thread.join(timeout=0.5)
     
     def butter_bandpass_coeffs(self, lowcut, highcut, fs, order=2):
-        """计算巴特沃斯带通滤波器系数（简化版）"""
+        """Documentation."""
         nyq = 0.5 * fs
         low = lowcut / nyq
         high = highcut / nyq
         
-        # 简化的二阶巴特沃斯滤波器
-        # 使用双线性变换近似
+        # 绠€鍖栫殑浜岄樁宸寸壒娌冩柉婊ゆ尝鍣?
+        # 浣跨敤鍙岀嚎鎬у彉鎹㈣繎浼?
         w1 = 2 * math.pi * lowcut
         w2 = 2 * math.pi * highcut
         
         return (low, high)
     
     def simple_bandpass_filter(self, data, lowcut, highcut, fs):
-        """简单的带通滤波器（FFT方法）"""
+        """Documentation."""
         if len(data) < 10:
             return data
             
@@ -422,20 +581,20 @@ class RadarDataProcessor:
         fft_data = np.fft.fft(data)
         freqs = np.fft.fftfreq(len(data), 1/fs)
         
-        # 创建带通滤波器掩码
+        # 鍒涘缓甯﹂€氭护娉㈠櫒鎺╃爜
         mask = np.zeros(len(freqs), dtype=bool)
         mask |= (np.abs(freqs) >= lowcut) & (np.abs(freqs) <= highcut)
         
-        # 应用滤波器
+        # 搴旂敤婊ゆ尝鍣?
         fft_filtered = fft_data * mask
         
-        # 逆FFT
+        # 閫咶FT
         filtered_data = np.fft.ifft(fft_filtered).real
         
         return filtered_data
     
     def moving_average_filter(self, data, window_size=5):
-        """移动平均滤波器"""
+        """Documentation."""
         if len(data) < window_size:
             return data
         
@@ -444,19 +603,19 @@ class RadarDataProcessor:
         return (cumsum[window_size:] - cumsum[:-window_size]) / window_size
     
     def estimate_rate(self, filtered_data, fs, freq_band):
-        """通过FFT估计心率或呼吸率"""
-        if len(filtered_data) < 100:  # 需要足够的数据点
+        """閫氳繃FFT浼拌蹇冪巼鎴栧懠鍚哥巼"""
+        if len(filtered_data) < 100:  # 闇€瑕佽冻澶熺殑鏁版嵁鐐?
             return 0
         
-        # FFT分析
+        # FFT鍒嗘瀽
         fft_data = np.fft.fft(filtered_data)
         freqs = np.fft.fftfreq(len(filtered_data), 1/fs)
         
-        # 只取正频率
+        # 鍙彇姝ｉ鐜?
         positive_freqs = freqs[:len(freqs)//2]
         positive_fft = np.abs(fft_data[:len(fft_data)//2])
         
-        # 在指定频带内找峰值
+        # 鍦ㄦ寚瀹氶甯﹀唴鎵惧嘲鍊?
         mask = (positive_freqs >= freq_band[0]) & (positive_freqs <= freq_band[1])
         if not np.any(mask):
             return 0
@@ -470,36 +629,37 @@ class RadarDataProcessor:
         peak_idx = np.argmax(band_fft)
         peak_freq = band_freqs[peak_idx]
         
-        # 转换为每分钟次数
+        # 杞崲涓烘瘡鍒嗛挓娆℃暟
         rate_bpm = peak_freq * 60
         
         return rate_bpm
     
     def process_radar_data(self):
-        """雷达数据处理线程"""
+        """闆疯揪鏁版嵁澶勭悊绾跨▼"""
         try:
             with DeviceFmcw() as device:
-                print("雷达SDK版本: " + get_version())
-                print("设备UUID: " + device.get_board_uuid())
-                print("传感器类型: " + str(device.get_sensor_type()))
+                print("闆疯揪SDK鐗堟湰: " + get_version())
+                print("璁惧UUID: " + device.get_board_uuid())
+                print("浼犳劅鍣ㄧ被鍨? " + str(device.get_sensor_type()))
                 
-                # 配置设备
+                # 閰嶇疆璁惧
                 sequence = device.create_simple_sequence(self.config)
                 device.set_acquisition_sequence(sequence)
                 
-                print("开始采集数据...")
+                print("寮€濮嬮噰闆嗘暟鎹?..")
                 self.is_running = True
                 
                 while self.is_running:
                     try:
-                        # 获取一帧数据
+                        # 鑾峰彇涓€甯ф暟鎹?
                         frame_contents = device.get_next_frame()
                         
                         for frame in frame_contents:
-                            # 提取相位信息和原始数据
+                            # 鎻愬彇鐩镐綅淇℃伅鍜屽師濮嬫暟鎹?
                             phase, raw_value = self.extract_phase_from_frame(frame)
+                            kd_feature = self.extract_kd_radar_feature(frame)
 
-                            # 同时计算实时范围-多普勒图
+                            # 鍚屾椂璁＄畻瀹炴椂鑼冨洿-澶氭櫘鍕掑浘
                             try:
                                 rd_cube = self.compute_range_doppler_cube(
                                     frame,
@@ -513,24 +673,25 @@ class RadarDataProcessor:
                                 with self.lock:
                                     self.latest_range_doppler = rd_db.tolist()
                             except Exception as rd_error:
-                                print(f"Range-Doppler 计算错误: {rd_error}")
+                                print(f"Range-Doppler 璁＄畻閿欒: {rd_error}")
 
                             with self.lock:
                                 self.frame_count += 1
                                 self.last_frame_time = time.time()
                                 self.raw_phase_buffer.append(phase)
+                                self.radar_feature_buffer.append(kd_feature)
                                 self.raw_data_buffer.append(raw_value)
                                 
-                                # 当有足够数据时进行处理
+                                # 褰撴湁瓒冲鏁版嵁鏃惰繘琛屽鐞?
                                 if len(self.raw_phase_buffer) >= 100:
                                     try:
-                                        # 相位解缠绕
+                                        # 鐩镐綅瑙ｇ紶缁?
                                         unwrapped_phase = self.unwrap_phase(self.raw_phase_buffer)
                                         
-                                        # 去除直流分量
+                                        # 鍘婚櫎鐩存祦鍒嗛噺
                                         unwrapped_phase = unwrapped_phase - np.mean(unwrapped_phase)
                                         
-                                        # 心率提取（使用FFT带通滤波）
+                                        # 蹇冪巼鎻愬彇锛堜娇鐢‵FT甯﹂€氭护娉級
                                         heart_signal = self.simple_bandpass_filter(
                                             unwrapped_phase, 
                                             self.heart_rate_band[0], 
@@ -540,7 +701,7 @@ class RadarDataProcessor:
                                         if len(heart_signal) > 0:
                                             self.heart_rate_buffer.append(heart_signal[-1])
                                         
-                                        # 呼吸率提取（使用FFT带通滤波）
+                                        # 鍛煎惛鐜囨彁鍙栵紙浣跨敤FFT甯﹂€氭护娉級
                                         respiratory_signal = self.simple_bandpass_filter(
                                             unwrapped_phase,
                                             self.respiratory_band[0],
@@ -550,17 +711,18 @@ class RadarDataProcessor:
                                         if len(respiratory_signal) > 0:
                                             self.respiratory_buffer.append(respiratory_signal[-1])
 
-                                        # Cross-modal KD 模型输出
+                                        # Cross-modal KD 妯″瀷杈撳嚭
                                         try:
-                                            kd_wave = self.kd_processor.predict(unwrapped_phase)
+                                            feature_seq = np.array(list(self.radar_feature_buffer)[-32:], dtype=np.float32)
+                                            kd_wave = self.kd_processor.predict(unwrapped_phase, feature_seq if len(feature_seq) >= 2 else None)
                                             self.latest_kd_waveform = [float(x) for x in kd_wave[-500:]]
-                                            self.current_kd_hr = self.kd_processor.estimate_hr(kd_wave)
+                                            self.current_kd_hr = self.kd_processor.last_model_hr or self.kd_processor.estimate_hr(kd_wave)
                                             self.kd_status = 'model' if self.kd_processor.model_loaded else 'fallback'
                                         except Exception as kd_error:
-                                            print(f"KD 模型实时处理错误: {kd_error}")
+                                            print(f"KD 妯″瀷瀹炴椂澶勭悊閿欒: {kd_error}")
                                             self.kd_status = 'error'
                                         
-                                        # 估计当前心率和呼吸率
+                                        # 浼拌褰撳墠蹇冪巼鍜屽懠鍚哥巼
                                         if len(self.heart_rate_buffer) >= 100:
                                             self.current_heart_rate = self.estimate_rate(
                                                 list(self.heart_rate_buffer)[-200:],
@@ -575,69 +737,69 @@ class RadarDataProcessor:
                                                 self.respiratory_band
                                             )
                                     except Exception as filter_error:
-                                        print(f"滤波处理错误: {filter_error}")
+                                        print(f"婊ゆ尝澶勭悊閿欒: {filter_error}")
                                         self.error_message = str(filter_error)
                         
-                        time.sleep(0.001)  # 短暂延迟避免CPU过载
+                        time.sleep(0.001)  # 鐭殏寤惰繜閬垮厤CPU杩囪浇
                     
                     except Exception as frame_error:
-                        print(f"帧处理错误: {frame_error}")
+                        print(f"甯у鐞嗛敊璇? {frame_error}")
                         self.error_message = str(frame_error)
                         time.sleep(0.1)
                     
         except Exception as e:
-            print(f"雷达数据处理错误: {e}")
+            print(f"闆疯揪鏁版嵁澶勭悊閿欒: {e}")
             print(traceback.format_exc())
             self.error_message = str(e)
             self.is_running = False
     
     def start(self):
-        """启动数据采集"""
+        """鍚姩鏁版嵁閲囬泦"""
         if not self.is_running:
             thread = threading.Thread(target=self.process_radar_data, daemon=True)
             thread.start()
-            # 启动串口读取线程
+            # 鍚姩涓插彛璇诲彇绾跨▼
             try:
                 self.start_serial_reader()
             except Exception as e:
-                print(f"启动串口读取失败: {e}")
+                print(f"鍚姩涓插彛璇诲彇澶辫触: {e}")
     
     def stop(self):
-        """停止数据采集"""
+        """鍋滄鏁版嵁閲囬泦"""
         self.is_running = False
-        # 停止串口读取
+        # 鍋滄涓插彛璇诲彇
         try:
             self.stop_serial_reader()
         except Exception as e:
-            print(f"停止串口读取失败: {e}")
+            print(f"鍋滄涓插彛璇诲彇澶辫触: {e}")
     
     def get_data(self):
-        """获取当前数据用于API响应"""
+        """鑾峰彇褰撳墠鏁版嵁鐢ㄤ簬API鍝嶅簲"""
         with self.lock:
-            # 确保返回的数据都是Python原生类型，避免JSON序列化错误
+            # 纭繚杩斿洖鐨勬暟鎹兘鏄疨ython鍘熺敓绫诲瀷锛岄伩鍏岼SON搴忓垪鍖栭敊璇?
             heart_waveform = [float(x) for x in list(self.heart_rate_buffer)[-100:]] if self.heart_rate_buffer else []
             resp_waveform = [float(x) for x in list(self.respiratory_buffer)[-100:]] if self.respiratory_buffer else []
             raw_waveform = [float(x) for x in list(self.raw_data_buffer)[-100:]] if self.raw_data_buffer else []
-            # 获取 ECG 数据的副本（使用单独锁以减少与雷达处理的竞争）
+            # 鑾峰彇 ECG 鏁版嵁鐨勫壇鏈紙浣跨敤鍗曠嫭閿佷互鍑忓皯涓庨浄杈惧鐞嗙殑绔炰簤锛?
             with self.serial_lock:
                 ecg_raw_list = list(self.ecg_buffer)[-2000:]
                 ecg_time_list = list(self.ecg_time_buffer)[-2000:]
 
-            # 为前端显示生成一个平滑/下采样版本（可选）
+            # 涓哄墠绔樉绀虹敓鎴愪竴涓钩婊?涓嬮噰鏍风増鏈紙鍙€夛級
             ecg_display = []
             if len(ecg_raw_list) > 0:
-                # 简单去直流并做短滑动平均以减少噪点
+                # 绠€鍗曞幓鐩存祦骞跺仛鐭粦鍔ㄥ钩鍧囦互鍑忓皯鍣偣
                 arr = np.array(ecg_raw_list, dtype=float)
                 arr = arr - np.mean(arr)
                 window = 3
                 if arr.size >= window:
                     cumsum = np.cumsum(np.insert(arr, 0, 0))
                     smooth = (cumsum[window:] - cumsum[:-window]) / window
-                    # 取最新 500 点用于展示
+                    # 鍙栨渶鏂?500 鐐圭敤浜庡睍绀?
                     ecg_display = [float(x) for x in smooth[-500:]]
                 else:
                     ecg_display = [float(x) for x in arr[-500:]]
-            # R 峰检测与心率估计
+            # R 宄版娴嬩笌蹇冪巼浼拌
             ecg_hr = 0.0
             try:
                 if len(ecg_raw_list) >= 60 and len(ecg_time_list) >= len(ecg_raw_list):
@@ -648,7 +810,7 @@ class RadarDataProcessor:
                     data_arr = np.array(ecg_raw_list[-len(times):], dtype=float)
                     data_arr = data_arr - np.mean(data_arr)
 
-                    # Butterworth 带通 0.5-40Hz
+                    # Butterworth 甯﹂€?0.5-40Hz
                     lowcut = 0.5
                     highcut = 40.0
                     if _has_scipy and butter is not None and filtfilt is not None:
@@ -662,14 +824,14 @@ class RadarDataProcessor:
                         filtered = np.fft.ifft(fft_data).real
                         
 
-                    # 平滑显示
+                    # 骞虫粦鏄剧ず
                     window = max(3, int(fs_est * 0.005))
                     if filtered.size >= window:
                         cumsum = np.cumsum(np.insert(filtered, 0, 0))
                         smoothf = (cumsum[window:] - cumsum[:-window]) / window
                         ecg_display = [float(x) for x in smoothf[-500:]] if smoothf.size > 0 else ecg_display
 
-                    # 峰值检测
+                    # 宄板€兼娴?
                     peaks_idx = []
                     if _has_scipy and find_peaks is not None:
                         min_dist = int(0.3 * fs_est)
@@ -693,12 +855,12 @@ class RadarDataProcessor:
                             if rr_mean > 0:
                                 ecg_hr = 60.0 / rr_mean
             except Exception as e:
-                print(f"ECG 实时处理错误: {e}")
+                print(f"ECG 瀹炴椂澶勭悊閿欒: {e}")
             
             return {
                 'heart_rate_waveform': heart_waveform,
                 'respiratory_waveform': resp_waveform,
-                'raw_data_waveform': raw_waveform,  # 新增：原始数据波形
+                'raw_data_waveform': raw_waveform,  # 鏂板锛氬師濮嬫暟鎹尝褰?
                 'ecg_waveform': ecg_raw_list[-500:],
                 'ecg_display': ecg_display,
                 'kd_waveform': self.latest_kd_waveform,
@@ -709,10 +871,10 @@ class RadarDataProcessor:
                 'doppler_axis': self.doppler_axis,
                 'current_heart_rate': float(self.current_heart_rate),
                 'current_respiratory_rate': float(self.current_respiratory_rate),
-                'frame_count': int(self.frame_count),  # 新增：帧计数
-                'is_running': bool(self.is_running),  # 新增：运行状态
-                'error_message': str(self.error_message),  # 新增：错误信息
-                'buffer_sizes': {  # 新增：缓冲区大小
+                'frame_count': int(self.frame_count),  # 鏂板锛氬抚璁℃暟
+                'is_running': bool(self.is_running),  # 鏂板锛氳繍琛岀姸鎬?
+                'error_message': str(self.error_message),  # 鏂板锛氶敊璇俊鎭?
+                'buffer_sizes': {  # 鏂板锛氱紦鍐插尯澶у皬
                     'raw_phase': len(self.raw_phase_buffer),
                     'heart_rate': len(self.heart_rate_buffer),
                     'respiratory': len(self.respiratory_buffer),
@@ -723,22 +885,22 @@ class RadarDataProcessor:
                 'timestamp': float(time.time())
             }
 
-# 创建全局处理器实例
+# 鍒涘缓鍏ㄥ眬澶勭悊鍣ㄥ疄渚?
 processor = RadarDataProcessor()
 
 @app.route('/')
 def index():
-    """主页面"""
+    """Documentation."""
     return render_template('index.html')
 
 @app.route('/api/data')
 def get_data():
-    """获取实时数据API"""
+    """鑾峰彇瀹炴椂鏁版嵁API"""
     try:
         data = processor.get_data()
         return jsonify(data)
     except Exception as e:
-        print(f"API错误: {e}")
+        print(f"API閿欒: {e}")
         print(traceback.format_exc())
         return jsonify({
             'error': str(e),
@@ -747,26 +909,22 @@ def get_data():
 
 @app.route('/api/start')
 def start_monitoring():
-    """启动监测"""
+    """鍚姩鐩戞祴"""
     processor.start()
     return jsonify({'status': 'started'})
 
 @app.route('/api/stop')
 def stop_monitoring():
-    """停止监测"""
+    """鍋滄鐩戞祴"""
     processor.stop()
     return jsonify({'status': 'stopped'})
 
 if __name__ == '__main__':
     print("=" * 60)
-    print("雷达心率/呼吸率监测系统")
+    print("Radar heart-rate / respiration monitor")
     print("=" * 60)
-    print("启动中...")
-    
-    # 自动启动数据采集
+    print("Starting...")
     processor.start()
-    
-    print("系统就绪! 请访问: http://localhost:5000")
-    print("按 Ctrl+C 停止服务器")
-    
+    print("Ready: http://localhost:5000")
+    print("Press Ctrl+C to stop")
     app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
