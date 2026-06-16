@@ -86,6 +86,7 @@ class DistilledHeartRateExtractor:
         self.model_type = None
         self.model = None
         self.last_model_hr = 0.0
+        self.last_filter_mode = 'fallback'
         self.load_model()
 
     def load_model(self):
@@ -223,25 +224,46 @@ class DistilledHeartRateExtractor:
             return signal
 
         signal = signal - np.median(signal)
+        base_filtered = self._bandpass(signal, self.heart_band[0], self.heart_band[1])
+
         if model_hr and 40.0 <= model_hr <= 180.0:
             center = model_hr / 60.0
-            low = max(self.heart_band[0], center - 0.28)
-            high = min(self.heart_band[1], center + 0.28)
+            low = max(self.heart_band[0], center - 0.38)
+            high = min(self.heart_band[1], center + 0.38)
             if high <= low + 0.05:
                 low, high = self.heart_band
         else:
             low, high = self.heart_band
 
+        kd_filtered = self._bandpass(signal, low, high)
+        base_std = float(np.std(base_filtered))
+        kd_std = float(np.std(kd_filtered))
+        tail_len = min(len(signal), max(32, int(self.fs * 5)))
+        base_tail_std = float(np.std(base_filtered[-tail_len:]))
+        kd_tail_std = float(np.std(kd_filtered[-tail_len:]))
+
+        if base_std < 1e-6:
+            filtered = kd_filtered
+            self.last_filter_mode = 'kd'
+        elif kd_std < 0.15 * base_std or (base_tail_std > 1e-6 and kd_tail_std < 0.10 * base_tail_std):
+            filtered = base_filtered
+            self.last_filter_mode = 'base_guard'
+        else:
+            gain = base_std / max(kd_std, 1e-6)
+            kd_filtered = kd_filtered * np.clip(gain, 0.5, 3.0)
+            filtered = 0.55 * kd_filtered + 0.45 * base_filtered
+            self.last_filter_mode = 'kd_blend'
+
+        return self.post_process(filtered)
+
+    def _bandpass(self, signal, low, high):
         if _has_scipy and butter is not None and filtfilt is not None and signal.size > int(self.fs * 3):
             try:
                 b, a = butter(3, [low / (0.5 * self.fs), high / (0.5 * self.fs)], btype='band')
-                filtered = filtfilt(b, a, signal)
+                return filtfilt(b, a, signal)
             except Exception:
-                filtered = self.simple_bandpass_1d(signal, low, high)
-        else:
-            filtered = self.simple_bandpass_1d(signal, low, high)
-
-        return self.post_process(filtered)
+                return self.simple_bandpass_1d(signal, low, high)
+        return self.simple_bandpass_1d(signal, low, high)
 
     def predict(self, signal, radar_features=None):
         signal = np.asarray(signal, dtype=float)
@@ -355,6 +377,13 @@ class RadarDataProcessor:
         self.latest_range_doppler = None  # 鏈€鏂拌寖鍥?澶氭櫘鍕掑浘骞呭害
         self.range_axis = []
         self.doppler_axis = []
+        self.target_min_m = 0.20
+        self.target_max_m = 1.20
+        self.last_target_bin = None
+        self.last_target_distance_m = 0.0
+        self.last_target_snr = 0.0
+        self.target_present = False
+        self.target_lost_frames = 0
         # BMD101/ECG 涓插彛鐩稿叧
         self.ecg_buffer = deque(maxlen=2000)  # 瀛樺偍瑙ｆ瀽鍚庣殑 ECG 鏍锋湰
         self.ecg_time_buffer = deque(maxlen=2000)  # 瀵瑰簲鏃堕棿鎴?
@@ -366,6 +395,7 @@ class RadarDataProcessor:
         self.current_heart_rate = 0  # 褰撳墠蹇冪巼BPM
         self.current_respiratory_rate = 0  # 褰撳墠鍛煎惛鐜嘊PM
         self.latest_kd_waveform = []
+        self.kd_wave_buffer = deque(maxlen=500)
         self.current_kd_hr = 0.0
         self.kd_status = 'fallback'
         self.kd_processor = DistilledHeartRateExtractor(fs=self.fs, heart_band=self.heart_rate_band)
@@ -386,7 +416,7 @@ class RadarDataProcessor:
                 end_frequency_Hz=61e9,
                 sample_rate_Hz=2e6,
                 num_samples=128,
-                rx_mask=1,
+                rx_mask=7,
                 tx_mask=1,
                 tx_power_level=31,
                 lp_cutoff_Hz=500000,
@@ -398,31 +428,56 @@ class RadarDataProcessor:
     def extract_phase_from_frame(self, frame_data):
         """Extract phase and display value from one radar frame."""
         try:
-            # frame_data 褰㈢姸: (1, 16, 128) - (澶╃嚎, 鎵, 閲囨牱鐐?
-            # 閫夋嫨鐗瑰畾璺濈鍖洪棿鐨勬暟鎹?(鍋囪鐩爣鍦ㄤ腑闂磋窛绂?
-            range_bin_start = 50  # 璺濈鍗曞厓璧峰
-            range_bin_end = 80    # 璺濈鍗曞厓缁撴潫
-            
-            # 鎻愬彇鎰熷叴瓒ｅ尯鍩熺殑鏁版嵁
-            roi_data = frame_data[0, :, range_bin_start:range_bin_end]
-            
-            # 璁＄畻骞冲潎骞呭害鏈€澶х殑璺濈鍗曞厓
-            amplitudes = np.abs(roi_data)
-            mean_amplitudes = np.mean(amplitudes, axis=0)
-            best_range_bin = np.argmax(mean_amplitudes)
-            
-            # 鎻愬彇璇ヨ窛绂诲崟鍏冪殑鏁版嵁
-            target_data = roi_data[:, best_range_bin]
-            
-            # 璁＄畻鐩镐綅
-            phase = np.angle(target_data.mean())
-            
-            # 鍚屾椂淇濆瓨鍘熷鏁版嵁鐨勫钩鍧囧€肩敤浜庢樉绀?
-            raw_value = float(np.mean(target_data.real))
-            
+            frame = np.asarray(frame_data)
+            if frame.ndim != 3:
+                raise ValueError(f"unexpected frame shape: {frame.shape}")
+
+            rx_count, chirp_count, sample_count = frame.shape
+            centered = frame - np.mean(frame, axis=2, keepdims=True)
+            window = np.hanning(sample_count).reshape(1, 1, -1)
+            range_fft = np.fft.fft(centered * window, axis=2)[..., :sample_count // 2]
+            magnitude = np.mean(np.abs(range_fft), axis=(0, 1))
+
+            range_axis = np.asarray(self.get_range_axis(sample_count), dtype=float)
+            if range_axis.size != magnitude.size:
+                range_axis = range_axis[:magnitude.size]
+            roi_mask = (range_axis >= self.target_min_m) & (range_axis <= self.target_max_m)
+            roi_indices = np.where(roi_mask)[0]
+            if roi_indices.size == 0:
+                roi_indices = np.arange(2, magnitude.size)
+
+            roi_magnitude = magnitude[roi_indices]
+            noise_floor = float(np.median(roi_magnitude) + 1e-6)
+            peak_local = int(np.argmax(roi_magnitude))
+            peak_bin = int(roi_indices[peak_local])
+            peak_value = float(roi_magnitude[peak_local])
+
+            if self.last_target_bin is not None:
+                track_min = max(int(roi_indices[0]), self.last_target_bin - 2)
+                track_max = min(int(roi_indices[-1]), self.last_target_bin + 2)
+                track_indices = np.arange(track_min, track_max + 1)
+                if track_indices.size > 0:
+                    track_values = magnitude[track_indices]
+                    track_peak_local = int(np.argmax(track_values))
+                    track_bin = int(track_indices[track_peak_local])
+                    track_value = float(track_values[track_peak_local])
+                    if track_value > 0.70 * peak_value:
+                        peak_bin = track_bin
+                        peak_value = track_value
+
+            snr = peak_value / noise_floor
+            self.last_target_bin = peak_bin
+            self.last_target_distance_m = float(range_axis[peak_bin]) if peak_bin < range_axis.size else 0.0
+            self.last_target_snr = float(snr)
+            self.target_present = bool(snr >= 1.35)
+
+            target_complex = range_fft[:, :, peak_bin]
+            phase = float(np.angle(np.mean(target_complex)))
+            raw_value = float(20.0 * np.log10(peak_value + 1e-6))
             return phase, raw_value
         except Exception as e:
             print(f"鎻愬彇鐩镐綅閿欒: {e}")
+            self.target_present = False
             return 0.0, 0.0
     
     def extract_kd_radar_feature(self, frame_data):
@@ -480,6 +535,17 @@ class RadarDataProcessor:
         phases = np.array(phase_buffer)
         unwrapped = np.unwrap(phases)
         return unwrapped
+
+    def clear_vital_buffers(self):
+        self.raw_phase_buffer.clear()
+        self.heart_rate_buffer.clear()
+        self.respiratory_buffer.clear()
+        self.radar_feature_buffer.clear()
+        self.kd_wave_buffer.clear()
+        self.latest_kd_waveform = []
+        self.current_heart_rate = 0.0
+        self.current_respiratory_rate = 0.0
+        self.current_kd_hr = 0.0
 
     def _serial_reader_loop(self):
         """Documentation."""
@@ -678,9 +744,18 @@ class RadarDataProcessor:
                             with self.lock:
                                 self.frame_count += 1
                                 self.last_frame_time = time.time()
+                                self.raw_data_buffer.append(raw_value)
+
+                                if not self.target_present:
+                                    self.target_lost_frames += 1
+                                    if self.target_lost_frames >= 20:
+                                        self.clear_vital_buffers()
+                                        self.kd_status = 'no_target'
+                                    continue
+
+                                self.target_lost_frames = 0
                                 self.raw_phase_buffer.append(phase)
                                 self.radar_feature_buffer.append(kd_feature)
-                                self.raw_data_buffer.append(raw_value)
                                 
                                 # 褰撴湁瓒冲鏁版嵁鏃惰繘琛屽鐞?
                                 if len(self.raw_phase_buffer) >= 100:
@@ -715,9 +790,14 @@ class RadarDataProcessor:
                                         try:
                                             feature_seq = np.array(list(self.radar_feature_buffer)[-32:], dtype=np.float32)
                                             kd_wave = self.kd_processor.predict(unwrapped_phase, feature_seq if len(feature_seq) >= 2 else None)
-                                            self.latest_kd_waveform = [float(x) for x in kd_wave[-500:]]
-                                            self.current_kd_hr = self.kd_processor.last_model_hr or self.kd_processor.estimate_hr(kd_wave)
-                                            self.kd_status = 'model' if self.kd_processor.model_loaded else 'fallback'
+                                            if len(kd_wave) > 0:
+                                                edge_guard = min(max(3, int(self.fs * 0.5)), max(1, len(kd_wave) // 4))
+                                                stable_sample = kd_wave[-edge_guard]
+                                                self.kd_wave_buffer.append(float(stable_sample))
+                                                self.latest_kd_waveform = [float(x) for x in list(self.kd_wave_buffer)[-500:]]
+                                            kd_hr_wave = np.array(self.latest_kd_waveform, dtype=float)
+                                            self.current_kd_hr = self.kd_processor.last_model_hr or self.kd_processor.estimate_hr(kd_hr_wave)
+                                            self.kd_status = self.kd_processor.last_filter_mode if self.kd_processor.model_loaded else 'fallback'
                                         except Exception as kd_error:
                                             print(f"KD 妯″瀷瀹炴椂澶勭悊閿欒: {kd_error}")
                                             self.kd_status = 'error'
@@ -866,6 +946,9 @@ class RadarDataProcessor:
                 'kd_waveform': self.latest_kd_waveform,
                 'kd_hr': float(self.current_kd_hr),
                 'kd_status': self.kd_status,
+                'target_present': bool(self.target_present),
+                'target_distance_m': float(self.last_target_distance_m),
+                'target_snr': float(self.last_target_snr),
                 'range_doppler_map': self.latest_range_doppler if self.latest_range_doppler is not None else [],
                 'range_axis': self.range_axis,
                 'doppler_axis': self.doppler_axis,
@@ -877,6 +960,7 @@ class RadarDataProcessor:
                 'buffer_sizes': {  # 鏂板锛氱紦鍐插尯澶у皬
                     'raw_phase': len(self.raw_phase_buffer),
                     'heart_rate': len(self.heart_rate_buffer),
+                    'kd': len(self.kd_wave_buffer),
                     'respiratory': len(self.respiratory_buffer),
                     'raw_data': len(self.raw_data_buffer),
                     'ecg': len(self.ecg_buffer)

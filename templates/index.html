@@ -552,7 +552,9 @@ async function updateData() {
     // Buffer info
     if (d.buffer_sizes) {
       const b = d.buffer_sizes;
-      document.getElementById('bufInfo').textContent = `HR:${b.heart_rate} RR:${b.respiratory} RAW:${b.raw_data} ECG:${b.ecg}`;
+      const dist = d.target_distance_m ? d.target_distance_m.toFixed(2) : '--';
+      const snr = d.target_snr ? d.target_snr.toFixed(1) : '--';
+      document.getElementById('bufInfo').textContent = `HR:${b.heart_rate} KD:${b.kd || 0} RR:${b.respiratory} RAW:${b.raw_data} ECG:${b.ecg} T:${dist}m SNR:${snr}`;
     }
     if (d.error_message) document.getElementById('errMsg').textContent = d.error_message.slice(0, 80);
 
