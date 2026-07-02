@@ -977,6 +977,12 @@ def index():
     """Documentation."""
     return render_template('index.html')
 
+@app.route('/mobile')
+@app.route('/m')
+def mobile_index():
+    """Mobile dashboard."""
+    return render_template('mobile.html')
+
 @app.route('/api/data')
 def get_data():
     """鑾峰彇瀹炴椂鏁版嵁API"""

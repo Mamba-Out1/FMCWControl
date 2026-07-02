@@ -1,0 +1,589 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+  <title>生命体征监测 - 移动端</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --surface: #161b22;
+      --surface2: #1c2230;
+      --border: #30363d;
+      --text: #e6edf3;
+      --muted: #8b949e;
+      --red: #ff4d6d;
+      --blue: #58a6ff;
+      --green: #3fb950;
+      --purple: #bc8cff;
+      --orange: #ffa657;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
+      padding-bottom: calc(24px + env(safe-area-inset-bottom));
+    }
+    .page {
+      max-width: 780px;
+      margin: 0 auto;
+      padding: 12px;
+    }
+    .topbar {
+      position: sticky;
+      top: 0;
+      z-index: 20;
+      background: rgba(13, 17, 23, 0.92);
+      backdrop-filter: blur(10px);
+      border-bottom: 1px solid var(--border);
+      padding: 12px;
+      margin: -12px -12px 12px;
+    }
+    .topbar-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .title { font-size: 16px; font-weight: 700; }
+    .subtitle { color: var(--muted); font-size: 12px; margin-top: 4px; }
+    .status {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+    .dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background: #555;
+    }
+    .dot.on {
+      background: var(--green);
+      box-shadow: 0 0 8px var(--green);
+    }
+    .controls {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+      margin-top: 12px;
+    }
+    .btn {
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      background: var(--surface);
+      color: var(--text);
+      padding: 12px 14px;
+      font-size: 14px;
+      font-weight: 600;
+    }
+    .btn.start { border-color: rgba(63,185,80,.4); color: var(--green); }
+    .btn.stop { border-color: rgba(255,77,109,.4); color: var(--red); }
+    .vitals {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+    .card, .panel {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      overflow: hidden;
+    }
+    .card {
+      padding: 14px;
+      min-height: 104px;
+    }
+    .label {
+      color: var(--muted);
+      font-size: 12px;
+      margin-bottom: 8px;
+    }
+    .value {
+      font-size: 32px;
+      font-weight: 700;
+      line-height: 1;
+    }
+    .unit {
+      font-size: 14px;
+      color: var(--muted);
+      margin-left: 4px;
+    }
+    .sub {
+      color: var(--muted);
+      font-size: 12px;
+      margin-top: 8px;
+      min-height: 18px;
+    }
+    .hr .value { color: var(--red); }
+    .kd .value { color: var(--purple); }
+    .ecg .value { color: var(--green); }
+    .rr .value { color: var(--blue); }
+    .panel { margin-bottom: 12px; }
+    .panel-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 12px 14px 0;
+      gap: 8px;
+    }
+    .panel-title {
+      font-size: 14px;
+      font-weight: 600;
+    }
+    .badge {
+      font-size: 11px;
+      padding: 2px 8px;
+      border-radius: 999px;
+      color: var(--text);
+      background: var(--surface2);
+      border: 1px solid var(--border);
+    }
+    .chart-box {
+      height: 170px;
+      padding: 10px 10px 12px;
+    }
+    .chart-box.short { height: 140px; }
+    #rdCanvas {
+      width: 100%;
+      height: 180px;
+      display: block;
+      image-rendering: pixelated;
+      background: #0a0f15;
+    }
+    .alarm-box {
+      padding: 12px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .alarm {
+      font-size: 12px;
+      padding: 6px 10px;
+      border-radius: 999px;
+    }
+    .ok { background: rgba(63,185,80,.15); color: var(--green); }
+    .warn { background: rgba(255,166,87,.15); color: var(--orange); }
+    .crit { background: rgba(255,77,109,.15); color: var(--red); }
+    .diag-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+      padding: 12px;
+    }
+    .diag-item {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px;
+    }
+    .diag-k {
+      color: var(--muted);
+      font-size: 11px;
+      margin-bottom: 6px;
+    }
+    .diag-v {
+      font-size: 14px;
+      word-break: break-word;
+    }
+    .footer-note {
+      color: var(--muted);
+      font-size: 12px;
+      text-align: center;
+      padding: 8px 0 4px;
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <div class="topbar">
+      <div class="topbar-row">
+        <div>
+          <div class="title">生命体征监测移动端</div>
+          <div class="subtitle">BGT60TR13C · 心率 / 呼吸 / KD蒸馏</div>
+        </div>
+        <div class="status">
+          <div class="dot" id="radarDot"></div>
+          <span id="radarLabel">雷达离线</span>
+        </div>
+      </div>
+      <div class="controls">
+        <button class="btn start" onclick="startMon()">开始采集</button>
+        <button class="btn stop" onclick="stopMon()">停止采集</button>
+      </div>
+    </div>
+
+    <div class="vitals">
+      <div class="card hr">
+        <div class="label">雷达心率</div>
+        <div><span class="value" id="vHR">--</span><span class="unit">BPM</span></div>
+        <div class="sub" id="vHRRange">正常范围 48–150</div>
+      </div>
+      <div class="card kd">
+        <div class="label">KD 蒸馏心率</div>
+        <div><span class="value" id="vKD">--</span><span class="unit">BPM</span></div>
+        <div class="sub" id="vKDStatus">模型未加载</div>
+      </div>
+      <div class="card ecg">
+        <div class="label">ECG 心率</div>
+        <div><span class="value" id="vECG">--</span><span class="unit">BPM</span></div>
+        <div class="sub">BMD101 参考值</div>
+      </div>
+      <div class="card rr">
+        <div class="label">呼吸频率</div>
+        <div><span class="value" id="vRR">--</span><span class="unit">BPM</span></div>
+        <div class="sub" id="vFrames">0 帧</div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head">
+        <div class="panel-title">状态提示</div>
+        <div class="badge" id="sysTime">--:--:--</div>
+      </div>
+      <div class="alarm-box" id="alarmStrip">
+        <span class="alarm ok">系统就绪</span>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head">
+        <div class="panel-title">心率波形</div>
+        <div class="badge">基础滤波</div>
+      </div>
+      <div class="chart-box"><canvas id="hrChart"></canvas></div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head">
+        <div class="panel-title">心率波形</div>
+        <div class="badge">KD 蒸馏</div>
+      </div>
+      <div class="chart-box"><canvas id="kdChart"></canvas></div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head">
+        <div class="panel-title">呼吸波形</div>
+        <div class="badge">0.15–0.5 Hz</div>
+      </div>
+      <div class="chart-box short"><canvas id="rrChart"></canvas></div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head">
+        <div class="panel-title">ECG 参考波形</div>
+        <div class="badge">BMD101</div>
+      </div>
+      <div class="chart-box short"><canvas id="ecgChart"></canvas></div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head">
+        <div class="panel-title">心率频谱</div>
+        <div class="badge">0.8–2.5 Hz</div>
+      </div>
+      <div class="chart-box short"><canvas id="hrSpecChart"></canvas></div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head">
+        <div class="panel-title">呼吸频谱</div>
+        <div class="badge">0.15–0.5 Hz</div>
+      </div>
+      <div class="chart-box short"><canvas id="rrSpecChart"></canvas></div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head">
+        <div class="panel-title">Range-Doppler 图</div>
+        <div class="badge">实时热力图</div>
+      </div>
+      <canvas id="rdCanvas"></canvas>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head">
+        <div class="panel-title">运行诊断</div>
+        <div class="badge" id="errBadge">正常</div>
+      </div>
+      <div class="diag-grid">
+        <div class="diag-item">
+          <div class="diag-k">帧率</div>
+          <div class="diag-v"><span id="fps">--</span> fps</div>
+        </div>
+        <div class="diag-item">
+          <div class="diag-k">目标状态</div>
+          <div class="diag-v" id="targetInfo">未锁定</div>
+        </div>
+        <div class="diag-item">
+          <div class="diag-k">缓冲区</div>
+          <div class="diag-v" id="bufInfo">--</div>
+        </div>
+        <div class="diag-item">
+          <div class="diag-k">错误信息</div>
+          <div class="diag-v" id="errMsg">--</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="footer-note">手机端与桌面端共用同一套实时数据接口</div>
+  </div>
+
+  <script>
+    function makeLineChart(id, color, fill=true) {
+      const ctx = document.getElementById(id).getContext('2d');
+      return new Chart(ctx, {
+        type: 'line',
+        data: {
+          labels: [],
+          datasets: [{
+            data: [],
+            borderColor: color,
+            backgroundColor: fill ? color.replace(')', ', 0.10)').replace('rgb', 'rgba') : 'transparent',
+            borderWidth: 1.6,
+            pointRadius: 0,
+            tension: 0.28,
+            fill: fill
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          animation: { duration: 0 },
+          scales: {
+            x: { display: false },
+            y: {
+              grid: { color: 'rgba(255,255,255,0.05)' },
+              ticks: { color: '#8b949e', maxTicksLimit: 5, font: { size: 10 } },
+              border: { color: '#30363d' }
+            }
+          },
+          plugins: { legend: { display: false }, tooltip: { enabled: false } }
+        }
+      });
+    }
+
+    function makeBarChart(id, color) {
+      const ctx = document.getElementById(id).getContext('2d');
+      return new Chart(ctx, {
+        type: 'bar',
+        data: {
+          labels: [],
+          datasets: [{ data: [], backgroundColor: color + '99', borderColor: color, borderWidth: 1 }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          animation: { duration: 0 },
+          scales: {
+            x: {
+              grid: { display: false },
+              ticks: { color: '#8b949e', maxTicksLimit: 8, font: { size: 9 } },
+              border: { color: '#30363d' }
+            },
+            y: {
+              grid: { color: 'rgba(255,255,255,0.05)' },
+              ticks: { color: '#8b949e', maxTicksLimit: 4, font: { size: 10 } },
+              border: { color: '#30363d' }
+            }
+          },
+          plugins: { legend: { display: false }, tooltip: { enabled: false } }
+        }
+      });
+    }
+
+    function setWaveform(chart, arr) {
+      if (!arr || !arr.length) return;
+      chart.data.labels = arr.map((_, i) => i);
+      chart.data.datasets[0].data = arr;
+      chart.update('none');
+    }
+
+    function updateSpectrum(chart, data, fs, fLow, fHigh) {
+      if (!data || data.length < 32) return;
+      const n = data.length;
+      const win = data.map((v, i) => v * (0.5 - 0.5 * Math.cos(2 * Math.PI * i / (n - 1))));
+      const freqs = [];
+      const mags = [];
+      for (let k = 0; k < n / 2; k++) {
+        const f = k * fs / n;
+        if (f < fLow || f > fHigh) continue;
+        let re = 0, im = 0;
+        const ang = 2 * Math.PI * k / n;
+        for (let t = 0; t < n; t++) {
+          re += win[t] * Math.cos(ang * t);
+          im -= win[t] * Math.sin(ang * t);
+        }
+        freqs.push(f.toFixed(2));
+        mags.push(Math.sqrt(re * re + im * im));
+      }
+      chart.data.labels = freqs;
+      chart.data.datasets[0].data = mags;
+      chart.update('none');
+    }
+
+    const hrChart = makeLineChart('hrChart', 'rgb(255,77,109)');
+    const kdChart = makeLineChart('kdChart', 'rgb(188,140,255)');
+    const rrChart = makeLineChart('rrChart', 'rgb(88,166,255)');
+    const ecgChart = makeLineChart('ecgChart', 'rgb(63,185,80)', false);
+    const hrSpecChart = makeBarChart('hrSpecChart', 'rgb(255,77,109)');
+    const rrSpecChart = makeBarChart('rrSpecChart', 'rgb(88,166,255)');
+
+    const rdCanvas = document.getElementById('rdCanvas');
+    const rdCtx = rdCanvas.getContext('2d');
+    function hslToRgb(h, s, l) {
+      s /= 100; l /= 100;
+      const k = n => (n + h / 30) % 12;
+      const a = s * Math.min(l, 1 - l);
+      const f = n => l - a * Math.max(-1, Math.min(k(n) - 3, Math.min(9 - k(n), 1)));
+      return [Math.round(255 * f(0)), Math.round(255 * f(8)), Math.round(255 * f(4))];
+    }
+    function renderHeatmap(matrix) {
+      if (!matrix || !matrix.length || !matrix[0].length) return;
+      const rows = matrix.length, cols = matrix[0].length;
+      rdCanvas.width = cols;
+      rdCanvas.height = rows;
+      const flat = matrix.flat();
+      const mn = Math.min(...flat), mx = Math.max(...flat), rng = Math.max(mx - mn, 1e-6);
+      const img = rdCtx.createImageData(cols, rows);
+      for (let r = 0; r < rows; r++) {
+        for (let c = 0; c < cols; c++) {
+          const norm = Math.min(Math.max((matrix[r][c] - mn) / rng, 0), 1);
+          const [R, G, B] = hslToRgb((1 - norm) * 240, 100, 50);
+          const i = ((rows - 1 - r) * cols + c) * 4;
+          img.data[i] = R;
+          img.data[i + 1] = G;
+          img.data[i + 2] = B;
+          img.data[i + 3] = 255;
+        }
+      }
+      rdCtx.putImageData(img, 0, 0);
+    }
+
+    function updateAlarms(data) {
+      const hr = data.current_heart_rate || 0;
+      const rr = data.current_respiratory_rate || 0;
+      const items = [];
+      if (!data.is_running) items.push({ cls: 'warn', msg: '雷达未运行' });
+      if (data.target_present) items.push({ cls: 'ok', msg: '已检测到人体目标' });
+      if (!data.target_present && data.is_running) items.push({ cls: 'warn', msg: '未锁定目标' });
+      if (hr > 0 && (hr < 48 || hr > 150)) items.push({ cls: 'crit', msg: `心率异常 ${hr.toFixed(0)} BPM` });
+      if (hr >= 48 && hr <= 150) items.push({ cls: 'ok', msg: '心率正常' });
+      if (rr > 0 && (rr < 9 || rr > 30)) items.push({ cls: 'crit', msg: `呼吸异常 ${rr.toFixed(0)} BPM` });
+      if (rr >= 9 && rr <= 30) items.push({ cls: 'ok', msg: '呼吸正常' });
+      if (data.error_message) items.push({ cls: 'warn', msg: data.error_message.slice(0, 40) });
+      document.getElementById('alarmStrip').innerHTML = items.length
+        ? items.map(x => `<span class="alarm ${x.cls}">${x.msg}</span>`).join('')
+        : '<span class="alarm ok">系统正常</span>';
+    }
+
+    let isRunning = false;
+    let timer = null;
+    let specTick = 0;
+    let lastHrWaveform = [];
+    let lastRrWaveform = [];
+    let lastFrameCount = 0;
+    let lastFrameTime = Date.now();
+    let fpsSmooth = 0;
+
+    async function updateData() {
+      try {
+        const res = await fetch('/api/data');
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const d = await res.json();
+        const fmt = v => v > 0 ? Number(v).toFixed(1) : '--';
+
+        document.getElementById('vHR').textContent = fmt(d.current_heart_rate);
+        document.getElementById('vKD').textContent = fmt(d.kd_hr);
+        document.getElementById('vECG').textContent = fmt(d.ecg_hr);
+        document.getElementById('vRR').textContent = fmt(d.current_respiratory_rate);
+        document.getElementById('vFrames').textContent = `${d.frame_count || 0} 帧`;
+        document.getElementById('vKDStatus').textContent = d.kd_status === 'model' ? '模型推理中' : '回退滤波模式';
+
+        const dot = document.getElementById('radarDot');
+        dot.className = 'dot' + (d.is_running ? ' on' : '');
+        document.getElementById('radarLabel').textContent = d.is_running ? '雷达运行中' : '雷达离线';
+
+        const now = Date.now();
+        const fc = d.frame_count || 0;
+        if (lastFrameCount > 0 && now > lastFrameTime) {
+          const rawFps = (fc - lastFrameCount) / ((now - lastFrameTime) / 1000);
+          fpsSmooth = fpsSmooth * 0.7 + rawFps * 0.3;
+          document.getElementById('fps').textContent = fpsSmooth.toFixed(1);
+        }
+        lastFrameCount = fc;
+        lastFrameTime = now;
+
+        if (d.buffer_sizes) {
+          const b = d.buffer_sizes;
+          document.getElementById('bufInfo').textContent = `HR:${b.heart_rate} KD:${b.kd || 0} RR:${b.respiratory} ECG:${b.ecg}`;
+        }
+
+        const dist = d.target_distance_m > 0 ? `${d.target_distance_m.toFixed(2)} m` : '--';
+        const snr = d.target_snr > 0 ? d.target_snr.toFixed(1) : '--';
+        document.getElementById('targetInfo').textContent = d.target_present ? `目标 ${dist} / SNR ${snr}` : '未锁定';
+
+        const errText = d.error_message ? d.error_message.slice(0, 80) : '--';
+        document.getElementById('errMsg').textContent = errText;
+        document.getElementById('errBadge').textContent = d.error_message ? '有告警' : '正常';
+
+        if (d.heart_rate_waveform?.length) {
+          setWaveform(hrChart, d.heart_rate_waveform);
+          lastHrWaveform = d.heart_rate_waveform;
+        }
+        if (d.kd_waveform?.length) setWaveform(kdChart, d.kd_waveform);
+        if (d.respiratory_waveform?.length) {
+          setWaveform(rrChart, d.respiratory_waveform);
+          lastRrWaveform = d.respiratory_waveform;
+        }
+        const ecg = d.ecg_display?.length ? d.ecg_display : d.ecg_waveform;
+        if (ecg?.length) setWaveform(ecgChart, ecg);
+
+        specTick++;
+        if (specTick % 5 === 0) {
+          if (lastHrWaveform.length >= 32) updateSpectrum(hrSpecChart, lastHrWaveform, 20, 0.8, 2.5);
+          if (lastRrWaveform.length >= 32) updateSpectrum(rrSpecChart, lastRrWaveform, 20, 0.15, 0.5);
+        }
+
+        if (d.range_doppler_map?.length) renderHeatmap(d.range_doppler_map);
+        updateAlarms(d);
+      } catch (e) {
+        document.getElementById('errMsg').textContent = e.message;
+        document.getElementById('errBadge').textContent = '接口错误';
+      }
+    }
+
+    function tickClock() {
+      document.getElementById('sysTime').textContent = new Date().toLocaleTimeString('zh-CN');
+    }
+    setInterval(tickClock, 1000);
+    tickClock();
+
+    async function startMon() {
+      if (isRunning) return;
+      await fetch('/api/start');
+      isRunning = true;
+      timer = setInterval(updateData, 120);
+      updateData();
+    }
+
+    async function stopMon() {
+      if (!isRunning) return;
+      await fetch('/api/stop');
+      isRunning = false;
+      clearInterval(timer);
+      timer = null;
+    }
+
+    window.addEventListener('load', () => setTimeout(startMon, 600));
+    window.addEventListener('beforeunload', stopMon);
+  </script>
+</body>
+</html>

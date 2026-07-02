@@ -1,0 +1,611 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>雷达生命体征模拟演示系统</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #0d1117;
+    --surface: #161b22;
+    --surface2: #1c2230;
+    --border: #30363d;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --red: #ff4d6d;
+    --blue: #58a6ff;
+    --green: #3fb950;
+    --purple: #bc8cff;
+    --orange: #ffa657;
+    --yellow: #e3b341;
+    --cyan: #39d353;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: var(--bg); color: var(--text); font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif; font-size: 14px; }
+
+  /* ── Top Header ── */
+  .header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 12px 24px; background: var(--surface);
+    border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 10;
+  }
+  .header-title { font-size: 1.1em; font-weight: 700; letter-spacing: .5px; }
+  .header-title span { color: var(--red); margin-right: 6px; }
+  .header-right { display: flex; align-items: center; gap: 20px; }
+  .sys-time { color: var(--muted); font-size: .85em; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--border); }
+  .dot.on { background: var(--green); box-shadow: 0 0 6px var(--green); animation: blink 2s infinite; }
+  @keyframes blink { 0%,100%{opacity:1} 50%{opacity:.4} }
+
+  /* ── Vital Signs Bar ── */
+  .vitals-bar {
+    display: grid; grid-template-columns: repeat(5, 1fr);
+    gap: 1px; background: var(--border);
+    border-bottom: 1px solid var(--border);
+  }
+  .vital { background: var(--surface); padding: 14px 20px; }
+  .vital-label { font-size: .75em; color: var(--muted); text-transform: uppercase; letter-spacing: .8px; margin-bottom: 4px; }
+  .vital-val { font-size: 2.2em; font-weight: 700; line-height: 1; }
+  .vital-unit { font-size: .65em; font-weight: 400; color: var(--muted); margin-left: 3px; }
+  .vital-sub { font-size: .75em; color: var(--muted); margin-top: 3px; }
+  .v-hr   .vital-val { color: var(--red); }
+  .v-rr   .vital-val { color: var(--blue); }
+  .v-kd   .vital-val { color: var(--purple); }
+  .v-ecg  .vital-val { color: var(--green); }
+  .v-stat .vital-val { color: var(--orange); font-size: 1.3em; }
+
+  /* ── Main Grid ── */
+  .main { display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: auto; gap: 1px; background: var(--border); }
+  .panel { background: var(--surface2); padding: 16px; position: relative; }
+  .panel.wide  { grid-column: 1 / -1; }
+  .panel.tall  { min-height: 260px; }
+
+  .panel-title { font-size: .78em; color: var(--muted); text-transform: uppercase; letter-spacing: .8px; margin-bottom: 12px; display: flex; align-items: center; gap: 8px; }
+  .panel-title .badge { font-size: .8em; padding: 1px 6px; border-radius: 4px; font-weight: 600; }
+  .badge-red    { background: rgba(255,77,109,.18); color: var(--red); }
+  .badge-purple { background: rgba(188,140,255,.18); color: var(--purple); }
+  .badge-blue   { background: rgba(88,166,255,.18); color: var(--blue); }
+  .badge-green  { background: rgba(63,185,80,.18); color: var(--green); }
+  .badge-orange { background: rgba(255,166,87,.18); color: var(--orange); }
+
+  .chart-wrap { position: relative; height: 200px; }
+  .chart-wrap.short { height: 160px; }
+
+  /* ── Health Metrics Grid ── */
+  .health-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+  .hm { background: var(--surface); border-radius: 8px; padding: 14px; border: 1px solid var(--border); }
+  .hm-label { font-size: .72em; color: var(--muted); margin-bottom: 6px; }
+  .hm-val { font-size: 1.6em; font-weight: 700; }
+  .hm-sub { font-size: .72em; color: var(--muted); margin-top: 4px; }
+  .hm-bar-wrap { margin-top: 8px; height: 4px; background: var(--border); border-radius: 2px; overflow: hidden; }
+  .hm-bar { height: 100%; border-radius: 2px; transition: width .5s; }
+
+  /* status ring for health score */
+  .score-wrap { display: flex; align-items: center; gap: 14px; }
+  .score-ring { position: relative; width: 60px; height: 60px; }
+  .score-ring svg { transform: rotate(-90deg); }
+  .score-ring .score-text { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 1em; font-weight: 700; }
+
+  /* ── Spectrum panels side by side ── */
+  .spec-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; background: var(--border); }
+  .spec-panel { background: var(--surface2); padding: 16px; }
+
+  /* ── Range-Doppler ── */
+  #rdCanvas { width: 100%; height: 160px; display: block; image-rendering: pixelated; }
+
+  /* ── Alarm strip ── */
+  .alarm-strip { background: var(--surface); border-bottom: 1px solid var(--border); padding: 6px 24px; display: flex; align-items: center; gap: 16px; min-height: 32px; }
+  .alarm-item { font-size: .78em; padding: 2px 8px; border-radius: 3px; }
+  .alarm-ok   { background: rgba(63,185,80,.15); color: var(--green); }
+  .alarm-warn { background: rgba(255,166,87,.15); color: var(--orange); }
+  .alarm-crit { background: rgba(255,77,109,.15); color: var(--red); animation: blink 1s infinite; }
+
+  /* ── Footer ── */
+  .footer { padding: 8px 24px; background: var(--surface); border-top: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
+  .footer-left { font-size: .75em; color: var(--muted); }
+  .btn { padding: 6px 16px; border: 1px solid var(--border); border-radius: 5px; background: transparent; color: var(--text); font-size: .8em; cursor: pointer; transition: all .2s; }
+  .btn:hover { background: var(--border); }
+  .btn.start { border-color: var(--green); color: var(--green); }
+  .btn.start:hover { background: rgba(63,185,80,.15); }
+  .btn.stop  { border-color: var(--red); color: var(--red); }
+  .btn.stop:hover  { background: rgba(255,77,109,.15); }
+</style>
+</head>
+<body>
+
+<!-- Header -->
+<div class="header">
+  <div class="header-title"><span>♥</span>雷达生命体征模拟演示系统 · BGT60TR13C / ECG</div>
+  <div class="header-right">
+    <span class="sys-time" id="sysTime">--:--:--</span>
+    <div style="display:flex;align-items:center;gap:6px;font-size:.8em;">
+      <div class="dot" id="radarDot"></div><span id="radarLabel" style="color:var(--muted)">模拟未运行</span>
+    </div>
+  </div>
+</div>
+
+<!-- Vitals Bar -->
+<div class="vitals-bar">
+  <div class="vital v-hr">
+    <div class="vital-label">❤ 雷达心率</div>
+    <div class="vital-val"><span id="vHR">--</span><span class="vital-unit">BPM</span></div>
+    <div class="vital-sub" id="vHRRange">正常范围 48–150</div>
+  </div>
+  <div class="vital v-kd">
+    <div class="vital-label">🧠 KD蒸馏心率</div>
+    <div class="vital-val"><span id="vKD">--</span><span class="vital-unit">BPM</span></div>
+    <div class="vital-sub" id="vKDStatus">模拟KD滤波</div>
+  </div>
+  <div class="vital v-ecg">
+    <div class="vital-label">🩺 ECG心率</div>
+    <div class="vital-val"><span id="vECG">--</span><span class="vital-unit">BPM</span></div>
+    <div class="vital-sub">模拟ECG参考值</div>
+  </div>
+  <div class="vital v-rr">
+    <div class="vital-label">🫁 呼吸率</div>
+    <div class="vital-val"><span id="vRR">--</span><span class="vital-unit">BPM</span></div>
+    <div class="vital-sub" id="vRRRange">正常范围 9–30</div>
+  </div>
+  <div class="vital v-stat">
+    <div class="vital-label">📡 系统状态</div>
+    <div class="vital-val"><span id="vFrames">0</span></div>
+    <div class="vital-sub">已采集帧数</div>
+  </div>
+</div>
+
+<!-- Alarm Strip -->
+<div class="alarm-strip" id="alarmStrip">
+  <span class="alarm-item alarm-ok">模拟系统就绪</span>
+</div>
+
+<!-- Main Content -->
+<div class="main">
+
+  <!-- Heart Rate Waveform: Filtered -->
+  <div class="panel tall">
+    <div class="panel-title">心率波形 <span class="badge badge-red">噪声较高的基础滤波</span></div>
+    <div class="chart-wrap"><canvas id="hrChart"></canvas></div>
+  </div>
+
+  <!-- Heart Rate Waveform: KD Model -->
+  <div class="panel tall">
+    <div class="panel-title">心率波形 <span class="badge badge-purple">KD过滤后高质量波形</span></div>
+    <div class="chart-wrap"><canvas id="kdChart"></canvas></div>
+  </div>
+
+  <!-- Respiratory Waveform (wide) -->
+  <div class="panel wide">
+    <div class="panel-title">呼吸率波形 <span class="badge badge-blue">带通滤波 0.15–0.5 Hz</span></div>
+    <div class="chart-wrap short"><canvas id="rrChart"></canvas></div>
+  </div>
+
+  <!-- Spectrogram panels -->
+  <div class="panel">
+    <div class="panel-title">心率频谱 <span class="badge badge-red">0.8–2.5 Hz</span></div>
+    <div class="chart-wrap short"><canvas id="hrSpecChart"></canvas></div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-title">呼吸率频谱 <span class="badge badge-blue">0.15–0.5 Hz</span></div>
+    <div class="chart-wrap short"><canvas id="rrSpecChart"></canvas></div>
+  </div>
+
+  <!-- Health Metrics Panel (wide) -->
+  <div class="panel wide">
+    <div class="panel-title">健康状态评估 <span class="badge badge-green">实时计算</span></div>
+    <div class="health-grid">
+
+      <!-- Health Score -->
+      <div class="hm">
+        <div class="hm-label">综合健康评分</div>
+        <div class="score-wrap">
+          <div class="score-ring">
+            <svg width="60" height="60" viewBox="0 0 60 60">
+              <circle cx="30" cy="30" r="24" fill="none" stroke="var(--border)" stroke-width="5"/>
+              <circle cx="30" cy="30" r="24" fill="none" stroke="var(--green)" stroke-width="5"
+                stroke-dasharray="150.8" stroke-dashoffset="150.8" id="scoreArc" stroke-linecap="round"/>
+            </svg>
+            <div class="score-text" id="scoreText">--</div>
+          </div>
+          <div>
+            <div class="hm-val" id="scoreVal" style="color:var(--green)">--</div>
+            <div class="hm-sub" id="scoreLabel">等待数据</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- HRV -->
+      <div class="hm">
+        <div class="hm-label">心率变异性 HRV</div>
+        <div class="hm-val" id="hrvVal" style="color:var(--orange)">-- <span style="font-size:.5em;font-weight:400">ms</span></div>
+        <div class="hm-sub" id="hrvLabel">正常 &gt;50ms</div>
+        <div class="hm-bar-wrap"><div class="hm-bar" id="hrvBar" style="width:0%;background:var(--orange)"></div></div>
+      </div>
+
+      <!-- Respiratory Irregularity -->
+      <div class="hm">
+        <div class="hm-label">呼吸规律性</div>
+        <div class="hm-val" id="rrRegVal" style="color:var(--blue)">--%</div>
+        <div class="hm-sub" id="rrRegLabel">规律呼吸 &gt;80%</div>
+        <div class="hm-bar-wrap"><div class="hm-bar" id="rrRegBar" style="width:0%;background:var(--blue)"></div></div>
+      </div>
+
+      <!-- Signal Quality -->
+      <div class="hm">
+        <div class="hm-label">雷达信号质量 SQI</div>
+        <div class="hm-val" id="sqiVal" style="color:var(--cyan)">--%</div>
+        <div class="hm-sub" id="sqiLabel">信号质量指数</div>
+        <div class="hm-bar-wrap"><div class="hm-bar" id="sqiBar" style="width:0%;background:var(--cyan)"></div></div>
+      </div>
+
+      <!-- HR/KD Consistency -->
+      <div class="hm">
+        <div class="hm-label">KD一致性</div>
+        <div class="hm-val" id="kdConsVal" style="color:var(--purple)">--%</div>
+        <div class="hm-sub" id="kdConsLabel">KD与基础滤波偏差</div>
+        <div class="hm-bar-wrap"><div class="hm-bar" id="kdConsBar" style="width:0%;background:var(--purple)"></div></div>
+      </div>
+
+      <!-- Stress Index -->
+      <div class="hm">
+        <div class="hm-label">压力指数 (心率/呼吸)</div>
+        <div class="hm-val" id="stressVal" style="color:var(--yellow)">--</div>
+        <div class="hm-sub" id="stressLabel">正常 &lt;4.0</div>
+        <div class="hm-bar-wrap"><div class="hm-bar" id="stressBar" style="width:0%;background:var(--yellow)"></div></div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ECG Waveform (wide) -->
+  <div class="panel wide">
+    <div class="panel-title">ECG 参考波形 <span class="badge badge-green">模拟BMD101参考</span></div>
+    <div class="chart-wrap short"><canvas id="ecgChart"></canvas></div>
+  </div>
+
+  <!-- Range-Doppler (wide) -->
+  <div class="panel wide">
+    <div class="panel-title">Range-Doppler 图 <span class="badge badge-orange">实时热力图</span></div>
+    <canvas id="rdCanvas"></canvas>
+  </div>
+
+</div>
+
+<!-- Footer -->
+<div class="footer">
+  <div class="footer-left">帧率: <span id="fps">--</span> fps &nbsp;|&nbsp; 缓冲: <span id="bufInfo">--</span> &nbsp;|&nbsp; <span id="errMsg" style="color:var(--red)"></span></div>
+  <div style="display:flex;gap:8px;">
+    <button class="btn start" onclick="startMon()">▶ 开始</button>
+    <button class="btn stop"  onclick="stopMon()">⏸ 暂停</button>
+  </div>
+</div>
+
+<script>
+// ── Chart factory ──────────────────────────────────────────────
+function makeLineChart(id, color, fill=true, yLabel='') {
+  const ctx = document.getElementById(id).getContext('2d');
+  return new Chart(ctx, {
+    type: 'line',
+    data: { labels: [], datasets: [{ data: [], borderColor: color, backgroundColor: fill ? color.replace(')',', 0.08)').replace('rgb','rgba') : 'transparent', borderWidth: 1.5, pointRadius: 0, tension: 0.3, fill }] },
+    options: {
+      responsive: true, maintainAspectRatio: false, animation: { duration: 0 },
+      scales: {
+        x: { display: false },
+        y: { grid: { color: 'rgba(255,255,255,0.04)' }, ticks: { color: '#8b949e', font: { size: 10 }, maxTicksLimit: 5 }, border: { color: '#30363d' } }
+      },
+      plugins: { legend: { display: false }, tooltip: { enabled: false } }
+    }
+  });
+}
+
+function makeBarChart(id, color, xLabel) {
+  const ctx = document.getElementById(id).getContext('2d');
+  return new Chart(ctx, {
+    type: 'bar',
+    data: { labels: [], datasets: [{ data: [], backgroundColor: color + '99', borderColor: color, borderWidth: 1 }] },
+    options: {
+      responsive: true, maintainAspectRatio: false, animation: { duration: 0 },
+      scales: {
+        x: { grid: { display: false }, ticks: { color: '#8b949e', font: { size: 9 }, maxTicksLimit: 8 }, border: { color: '#30363d' } },
+        y: { grid: { color: 'rgba(255,255,255,0.04)' }, ticks: { color: '#8b949e', font: { size: 10 }, maxTicksLimit: 4 }, border: { color: '#30363d' } }
+      },
+      plugins: { legend: { display: false }, tooltip: { enabled: false } }
+    }
+  });
+}
+
+const hrChart      = makeLineChart('hrChart',      'rgb(255,77,109)');
+const kdChart      = makeLineChart('kdChart',      'rgb(188,140,255)');
+const rrChart      = makeLineChart('rrChart',      'rgb(88,166,255)');
+const ecgChart     = makeLineChart('ecgChart',     'rgb(63,185,80)', false);
+const hrSpecChart  = makeBarChart ('hrSpecChart',  'rgb(255,77,109)');
+const rrSpecChart  = makeBarChart ('rrSpecChart',  'rgb(88,166,255)');
+
+// ── Range-Doppler heatmap ──────────────────────────────────────
+const rdCanvas = document.getElementById('rdCanvas');
+const rdCtx    = rdCanvas.getContext('2d');
+function hslToRgb(h, s, l) {
+  s /= 100; l /= 100;
+  const k = n => (n + h / 30) % 12;
+  const a = s * Math.min(l, 1 - l);
+  const f = n => l - a * Math.max(-1, Math.min(k(n) - 3, Math.min(9 - k(n), 1)));
+  return [Math.round(255*f(0)), Math.round(255*f(8)), Math.round(255*f(4))];
+}
+function renderHeatmap(matrix) {
+  if (!matrix || !matrix.length || !matrix[0].length) return;
+  const rows = matrix.length, cols = matrix[0].length;
+  rdCanvas.width = cols; rdCanvas.height = rows;
+  const flat = matrix.flat();
+  const mn = Math.min(...flat), mx = Math.max(...flat), rng = Math.max(mx - mn, 1e-6);
+  const img = rdCtx.createImageData(cols, rows);
+  for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
+    const norm = Math.min(Math.max((matrix[r][c] - mn) / rng, 0), 1);
+    const [R,G,B] = hslToRgb((1 - norm) * 240, 100, 50);
+    const i = ((rows - 1 - r) * cols + c) * 4;
+    img.data[i] = R; img.data[i+1] = G; img.data[i+2] = B; img.data[i+3] = 255;
+  }
+  rdCtx.putImageData(img, 0, 0);
+}
+
+// ── Spectrum computation ───────────────────────────────────────
+function computeSpectrum(data, fs, fLow, fHigh) {
+  if (data.length < 32) return { freqs: [], mags: [] };
+  const n = data.length;
+  const freqs = Array.from({length: Math.floor(n/2)}, (_,i) => i * fs / n);
+  // simple DFT-like via JS (just use magnitude of re/im via Goertzel is too slow; approximate via FFT hint)
+  // We do a windowed magnitude estimate: send raw data, compute in chunks
+  const re = new Float32Array(n), im = new Float32Array(n);
+  const win = Float32Array.from(data, (v,i) => v * (0.5 - 0.5*Math.cos(2*Math.PI*i/(n-1))));
+  // Cooley-Tukey FFT (iterative, power-of-2 padding skipped for simplicity – use Chart.js bar with filtered freqs)
+  const mags = freqs.map((f, i) => {
+    if (f < fLow || f > fHigh) return 0;
+    let re = 0, im2 = 0;
+    const angle = 2 * Math.PI * i / n;
+    for (let t = 0; t < n; t++) { re += win[t]*Math.cos(angle*t); im2 -= win[t]*Math.sin(angle*t); }
+    return Math.sqrt(re*re + im2*im2);
+  });
+  const inBand = freqs.map((f,i) => f >= fLow && f <= fHigh ? {f, m: mags[i]} : null).filter(Boolean);
+  return { freqs: inBand.map(x => x.f.toFixed(2)), mags: inBand.map(x => x.m) };
+}
+
+function updateSpectrum(chart, data, fs, fLow, fHigh) {
+  if (data.length < 32) return;
+  const n = data.length;
+  const win = data.map((v,i) => v * (0.5 - 0.5*Math.cos(2*Math.PI*i/(n-1))));
+  const freqs=[], mags=[];
+  for (let k = 0; k < n/2; k++) {
+    const f = k * fs / n;
+    if (f < fLow || f > fHigh) continue;
+    let re = 0, im = 0;
+    const ang = 2*Math.PI*k/n;
+    for (let t = 0; t < n; t++) { re += win[t]*Math.cos(ang*t); im -= win[t]*Math.sin(ang*t); }
+    freqs.push(f.toFixed(2));
+    mags.push(Math.sqrt(re*re + im*im));
+  }
+  chart.data.labels = freqs;
+  chart.data.datasets[0].data = mags;
+  chart.update('none');
+}
+
+// ── Waveform update helper ─────────────────────────────────────
+function setWaveform(chart, arr) {
+  if (!arr || !arr.length) return;
+  chart.data.labels = arr.map((_,i) => i);
+  chart.data.datasets[0].data = arr;
+  chart.update('none');
+}
+
+// ── Health metrics ─────────────────────────────────────────────
+const hrHistory = [], rrHistory = [], kdHistory = [];
+let lastFrameCount = 0, lastFrameTime = Date.now(), fpsSmooth = 0;
+
+function estimateHRV(hr_bpm_series) {
+  if (hr_bpm_series.length < 4) return 0;
+  const rr_ms = hr_bpm_series.map(bpm => bpm > 0 ? 60000/bpm : 0).filter(x => x > 0);
+  if (rr_ms.length < 2) return 0;
+  const diffs = rr_ms.slice(1).map((v,i) => (v - rr_ms[i])**2);
+  return Math.sqrt(diffs.reduce((a,b)=>a+b,0)/diffs.length);
+}
+
+function respiratoryRegularity(rr_waveform) {
+  if (rr_waveform.length < 20) return 0;
+  const arr = rr_waveform.slice(-100);
+  const mean = arr.reduce((a,b)=>a+b,0)/arr.length;
+  const std  = Math.sqrt(arr.map(x=>(x-mean)**2).reduce((a,b)=>a+b,0)/arr.length);
+  const cv   = mean !== 0 ? std / Math.abs(mean) : 1;
+  return Math.max(0, Math.min(100, 100 * (1 - cv)));
+}
+
+function signalQuality(raw_waveform) {
+  if (raw_waveform.length < 10) return 0;
+  const arr = raw_waveform.slice(-50);
+  const mean = arr.reduce((a,b)=>a+b,0)/arr.length;
+  const std  = Math.sqrt(arr.map(x=>(x-mean)**2).reduce((a,b)=>a+b,0)/arr.length);
+  const snr  = mean !== 0 ? Math.abs(mean) / (std + 1e-6) : 0;
+  return Math.min(100, snr * 20);
+}
+
+function setBar(id, pct, colorVar) {
+  const el = document.getElementById(id);
+  if (el) { el.style.width = Math.min(100, Math.max(0, pct)) + '%'; }
+}
+
+function updateHealth(data) {
+  const hr = data.current_heart_rate || 0;
+  const rr = data.current_respiratory_rate || 0;
+  const kd = data.kd_hr || 0;
+
+  if (hr > 0) hrHistory.push(hr);
+  if (rr > 0) rrHistory.push(rr);
+  if (kd > 0) kdHistory.push(kd);
+  if (hrHistory.length > 60) hrHistory.shift();
+  if (rrHistory.length > 60) rrHistory.shift();
+  if (kdHistory.length > 60) kdHistory.shift();
+
+  // HRV
+  const hrv = estimateHRV(hrHistory);
+  document.getElementById('hrvVal').innerHTML = hrv > 0 ? hrv.toFixed(0) + '<span style="font-size:.5em;font-weight:400"> ms</span>' : '--';
+  const hrvPct = Math.min(100, hrv / 100 * 100);
+  setBar('hrvBar', hrvPct);
+  document.getElementById('hrvLabel').textContent = hrv > 50 ? '✓ 良好' : hrv > 20 ? '⚠ 偏低' : hrv > 0 ? '⚠ 较低' : '等待数据';
+
+  // Respiratory regularity
+  const rrReg = respiratoryRegularity(data.respiratory_waveform || []);
+  document.getElementById('rrRegVal').textContent = rrReg > 0 ? rrReg.toFixed(0) + '%' : '--%';
+  setBar('rrRegBar', rrReg);
+  document.getElementById('rrRegLabel').textContent = rrReg > 80 ? '✓ 规律' : rrReg > 50 ? '⚠ 轻度不规律' : rrReg > 0 ? '⚠ 不规律' : '等待数据';
+
+  // SQI
+  const sqi = signalQuality(data.raw_data_waveform || []);
+  document.getElementById('sqiVal').textContent = sqi > 0 ? sqi.toFixed(0) + '%' : '--%';
+  setBar('sqiBar', sqi);
+  document.getElementById('sqiLabel').textContent = sqi > 70 ? '✓ 信号良好' : sqi > 30 ? '⚠ 信号一般' : sqi > 0 ? '⚠ 信号弱' : '等待信号';
+
+  // KD Consistency
+  let kdCons = 0;
+  if (hr > 0 && kd > 0) {
+    const diff = Math.abs(hr - kd) / Math.max(hr, kd) * 100;
+    kdCons = Math.max(0, 100 - diff);
+  }
+  document.getElementById('kdConsVal').textContent = kdCons > 0 ? kdCons.toFixed(0) + '%' : '--%';
+  setBar('kdConsBar', kdCons);
+  document.getElementById('kdConsLabel').textContent = kdCons > 90 ? '✓ 高度一致' : kdCons > 70 ? '⚠ 基本一致' : kdCons > 0 ? '⚠ 偏差较大' : '等待数据';
+
+  // Stress index (HR / RR ratio, normal ~3-4)
+  const stress = rr > 0 ? hr / rr : 0;
+  document.getElementById('stressVal').textContent = stress > 0 ? stress.toFixed(1) : '--';
+  setBar('stressBar', Math.min(100, stress / 8 * 100));
+  document.getElementById('stressLabel').textContent = stress > 0 && stress < 4 ? '✓ 放松' : stress >= 4 && stress < 6 ? '⚠ 轻度紧张' : stress >= 6 ? '⚠ 紧张' : '等待数据';
+
+  // Overall health score
+  let score = 0, cnt = 0;
+  if (hrv > 0) { score += Math.min(100, hrv); cnt++; }
+  if (rrReg > 0) { score += rrReg; cnt++; }
+  if (sqi > 0)  { score += sqi; cnt++; }
+  if (kdCons > 0) { score += kdCons; cnt++; }
+  if (stress > 0) { score += Math.max(0, 100 - Math.abs(stress - 3.5) * 20); cnt++; }
+  const finalScore = cnt > 0 ? Math.round(score / cnt) : 0;
+  document.getElementById('scoreVal').textContent = finalScore > 0 ? finalScore : '--';
+  document.getElementById('scoreText').textContent = finalScore > 0 ? finalScore : '--';
+  const scoreColor = finalScore >= 80 ? 'var(--green)' : finalScore >= 60 ? 'var(--orange)' : 'var(--red)';
+  document.getElementById('scoreVal').style.color = scoreColor;
+  document.getElementById('scoreLabel').textContent = finalScore >= 80 ? '健康状态良好' : finalScore >= 60 ? '状态一般' : finalScore > 0 ? '需要关注' : '等待数据';
+  const arc = document.getElementById('scoreArc');
+  const circ = 2 * Math.PI * 24;
+  arc.style.stroke = scoreColor;
+  arc.setAttribute('stroke-dashoffset', (circ * (1 - finalScore / 100)).toFixed(1));
+}
+
+// ── Alarms ────────────────────────────────────────────────────
+function updateAlarms(data) {
+  const hr = data.current_heart_rate || 0;
+  const rr = data.current_respiratory_rate || 0;
+  const alarms = [];
+  if (!data.is_running) alarms.push({ cls: 'alarm-warn', msg: '⚠ 模拟未运行' });
+  if (hr > 0 && (hr < 48 || hr > 150)) alarms.push({ cls: 'alarm-crit', msg: `⚠ 心率异常: ${hr.toFixed(0)} BPM` });
+  if (hr >= 48 && hr <= 150) alarms.push({ cls: 'alarm-ok', msg: `✓ 心率正常` });
+  if (rr > 0 && (rr < 9 || rr > 30)) alarms.push({ cls: 'alarm-crit', msg: `⚠ 呼吸异常: ${rr.toFixed(0)} BPM` });
+  if (rr >= 9 && rr <= 30) alarms.push({ cls: 'alarm-ok', msg: `✓ 呼吸正常` });
+  if (data.error_message) alarms.push({ cls: 'alarm-warn', msg: '⚠ ' + data.error_message.slice(0, 60) });
+  const strip = document.getElementById('alarmStrip');
+  strip.innerHTML = alarms.length
+    ? alarms.map(a => `<span class="alarm-item ${a.cls}">${a.msg}</span>`).join('')
+    : '<span class="alarm-item alarm-ok">系统正常</span>';
+}
+
+// ── Main update loop ───────────────────────────────────────────
+let isRunning = false, timer = null, specTick = 0;
+let lastHrWaveform = [], lastRrWaveform = [];
+
+async function updateData() {
+  try {
+    const res = await fetch('/api/data');
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const d = await res.json();
+
+    // Vitals
+    const fmt = v => v > 0 ? v.toFixed(1) : '--';
+    document.getElementById('vHR').textContent  = fmt(d.current_heart_rate);
+    document.getElementById('vRR').textContent  = fmt(d.current_respiratory_rate);
+    document.getElementById('vKD').textContent  = fmt(d.kd_hr);
+    document.getElementById('vECG').textContent = fmt(d.ecg_hr);
+    document.getElementById('vFrames').textContent = d.frame_count || 0;
+    document.getElementById('vKDStatus').textContent = d.simulation_mode ? '✓ 模拟KD过滤' : (d.kd_status === 'model' ? '✓ 模型推理' : '~ 回退滤波');
+
+    // Radar dot
+    const dot = document.getElementById('radarDot');
+    const lbl = document.getElementById('radarLabel');
+    dot.className = 'dot' + (d.is_running ? ' on' : '');
+    lbl.textContent = d.is_running ? '模拟播放中' : '模拟已暂停';
+
+    // FPS
+    const now = Date.now();
+    const fc = d.frame_count || 0;
+    if (lastFrameCount > 0 && now > lastFrameTime) {
+      const rawFps = (fc - lastFrameCount) / ((now - lastFrameTime) / 1000);
+      fpsSmooth = fpsSmooth * 0.7 + rawFps * 0.3;
+      document.getElementById('fps').textContent = fpsSmooth.toFixed(1);
+    }
+    lastFrameCount = fc; lastFrameTime = now;
+
+    // Buffer info
+    if (d.buffer_sizes) {
+      const b = d.buffer_sizes;
+      const dist = d.target_distance_m ? d.target_distance_m.toFixed(2) : '--';
+      const snr = d.target_snr ? d.target_snr.toFixed(1) : '--';
+      document.getElementById('bufInfo').textContent = `HR:${b.heart_rate} KD:${b.kd || 0} RR:${b.respiratory} RAW:${b.raw_data} ECG:${b.ecg} T:${dist}m SNR:${snr}`;
+    }
+    if (d.error_message) document.getElementById('errMsg').textContent = d.error_message.slice(0, 80);
+
+    // Waveforms
+    if (d.heart_rate_waveform?.length) { setWaveform(hrChart, d.heart_rate_waveform); lastHrWaveform = d.heart_rate_waveform; }
+    if (d.kd_waveform?.length)         setWaveform(kdChart, d.kd_waveform);
+    if (d.respiratory_waveform?.length) { setWaveform(rrChart, d.respiratory_waveform); lastRrWaveform = d.respiratory_waveform; }
+    const ecg = d.ecg_display?.length ? d.ecg_display : d.ecg_waveform;
+    if (ecg?.length) setWaveform(ecgChart, ecg);
+
+    // Spectrum (every 5 ticks ≈ 0.5s to limit DFT cost)
+    specTick++;
+    if (specTick % 5 === 0) {
+      if (lastHrWaveform.length >= 32) updateSpectrum(hrSpecChart, lastHrWaveform, 20, 0.8, 2.5);
+      if (lastRrWaveform.length >= 32) updateSpectrum(rrSpecChart, lastRrWaveform, 20, 0.15, 0.5);
+    }
+
+    // Range-Doppler
+    if (d.range_doppler_map?.length) renderHeatmap(d.range_doppler_map);
+
+    // Health & Alarms
+    updateHealth(d);
+    updateAlarms(d);
+
+  } catch (e) {
+    document.getElementById('errMsg').textContent = e.message;
+  }
+}
+
+// ── Clock ──────────────────────────────────────────────────────
+function tickClock() {
+  document.getElementById('sysTime').textContent = new Date().toLocaleTimeString('zh-CN');
+}
+setInterval(tickClock, 1000); tickClock();
+
+// ── Controls ───────────────────────────────────────────────────
+async function startMon() {
+  if (isRunning) return;
+  await fetch('/api/start');
+  isRunning = true;
+  timer = setInterval(updateData, 100);
+}
+async function stopMon() {
+  if (!isRunning) return;
+  await fetch('/api/stop');
+  isRunning = false;
+  clearInterval(timer);
+}
+
+window.addEventListener('load', () => setTimeout(startMon, 800));
+window.addEventListener('beforeunload', stopMon);
+</script>
+</body>
+</html>
